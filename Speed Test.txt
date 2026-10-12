@@ -1,0 +1,4058 @@
+// ==WindhawkMod==
+// @id              internet-speed-on-taskbar
+// @name            Internet Speed On Taskbar
+// @description     Native-style live upload/download speed inside the taskbar, plus a built-in native speed test. Works alongside other taskbar mods.
+// @version         5.7
+// @author          krish
+// @github          https://github.com/Webspace-com
+// @include         explorer.exe
+// @include         ShellHost.exe
+// @include         ShellExperienceHost.exe
+// @include         RuntimeBroker.exe
+// @architecture    x86-64
+// @compilerOptions -liphlpapi -lgdi32 -luser32 -ladvapi32 -lshell32 -lole32 -loleaut32 -luuid
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Internet Speed On Taskbar
+Live upload (↑) and download (↓) speed inside the Windows taskbar.
+
+## Native speed test
+Right-click the meter and choose **Run speed test**. A small panel opens
+above the taskbar and measures ping, jitter, download and upload against
+Cloudflare's nearest server, right inside Windows. No browser, no Bing.
+
+With **Replace Windows "Perform speed test"** on, the speed test entry in the
+network icon's right-click menu opens this panel instead of Bing.
+
+## Works with other mods
+* Hooks only process launches (`ShellExecute`, `CreateProcessInternalW`) in
+  explorer and the shell helpers that host the speed test button
+  (ShellHost, ShellExperienceHost, RuntimeBroker), and only to catch that
+  one Microsoft link. The meter itself runs in explorer only.
+  Everything else passes straight through, and you can turn it off. It adds its own child window to the taskbar and touches no taskbar
+  functions, so it can't conflict with other taskbar mods.
+* Because it is a child of the taskbar, it follows any mod that moves,
+  animates, fades, auto-hides or resizes the taskbar (e.g. Taskbar Auto-Hide
+  Instant Show, taskbar height/position mods, ExplorerPatcher).
+
+
+## Placement
+* **Right:** just left of the notification area (tray, quick settings,
+  clock).
+* **Left:** after Widgets (Windows 11) or after Start/Search/Task View
+  (Windows 10 / ExplorerPatcher; task buttons shift over to make room).
+* Windows 11 with left-aligned icons: Left would cover Start, so Right is
+  used.
+
+## Adapts to
+Per-monitor DPI, Windows 11 Text size, light/dark/accent taskbar (separate
+arrow colors for light mode, gamma-correct dark text), Transparency effects
+(optional contrast halo), high contrast, explorer restarts, monitors added/removed, vertical taskbars
+(Windows 10). Counts physical adapters only (VPNs aren't double counted);
+use Adapter filter to pick one.
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- position: right
+  $name: Position
+  $options:
+  - right: Right (next to quick settings / tray)
+  - left: Left (after Widgets or Start)
+- gap: 6
+  $name: Gap (px)
+  $description: Space between the meter and its anchor, at 100% scaling
+- monitors: primary
+  $name: Show on
+  $options:
+  - primary: Main taskbar only
+  - all: All taskbars
+- lines: auto
+  $name: Layout
+  $options:
+  - auto: Auto (two lines if they fit)
+  - two: Two lines
+  - one: One line
+- fontFamily: ""
+  $name: Font
+  $description: Leave empty to use your Windows UI font, or type a font name to override it
+- fontSize: 9
+  $name: Font size (pt)
+  $description: 9 matches the taskbar clock
+- letterSpacing: 0
+  $name: Letter spacing (px)
+  $description: Extra space between characters, at 100% scaling. 0 = font default
+- lineSpacing: 2
+  $name: Line spacing (px)
+  $description: Extra space between the upload and download lines, at 100% scaling
+- bold: false
+  $name: Semibold text
+- textColor: auto
+  $name: Text color
+  $description: auto follows light/dark taskbar, or a hex color like #FFFFFF
+- upArrowColor: "#87CEFA"
+  $name: Upload arrow color (dark taskbar)
+  $description: Hex color (default light sky blue), or auto to match the text
+- downArrowColor: "#90EE90"
+  $name: Download arrow color (dark taskbar)
+  $description: Hex color (default light green), or auto to match the text
+- upArrowColorLight: "#005FB8"
+  $name: Upload arrow color (light taskbar)
+  $description: Hex color (default deep blue), or auto to match the text
+- downArrowColorLight: "#0F7B0F"
+  $name: Download arrow color (light taskbar)
+  $description: Hex color (default deep green), or auto to match the text
+- contrastOutline: auto
+  $name: Contrast outline
+  $description: Soft halo behind the text so it stays readable on a see-through taskbar
+  $options:
+  - auto: Auto (dark taskbar with Transparency effects on)
+  - on: Always
+  - off: Never
+- units: bytes
+  $name: Units
+  $options:
+  - bytes: Bytes (KB/s, MB/s)
+  - bits: Bits (Kbps, Mbps)
+- interval: 1000
+  $name: Update interval (ms)
+- adapter: ""
+  $name: Adapter filter
+  $description: Empty = all physical adapters. Or part of an adapter name, e.g. Wi-Fi
+- clickOpensTaskManager: false
+  $name: Click opens Task Manager
+  $description: When off, clicks pass through to the taskbar
+- rightClickMenu: true
+  $name: Right-click menu
+  $description: Run speed test, Task Manager and Network settings. When off, right-clicks pass through to the taskbar
+- replaceWindowsSpeedTest: false
+  $name: Replace Windows "Perform speed test"
+  $description: The network icon's speed test opens the native panel instead of Bing in your browser
+*/
+// ==/WindhawkModSettings==
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-W#warnings"
+#include <winsock2.h>
+#include <ws2ipdef.h>
+#pragma GCC diagnostic pop
+#include <windhawk_utils.h>
+#include <windows.h>
+#include <shellapi.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#include <uiautomation.h>
+
+#include <algorithm>
+#include <atomic>
+#include <climits>
+#include <cwctype>
+#include <string>
+#include <vector>
+
+// =====================================================================
+// Internet speed meter
+// ---------------------------------------------------------------------
+// Design notes (why it is built this way):
+//  * The meter is a real child window of the taskbar (Shell_TrayWnd /
+//    Shell_SecondaryTrayWnd), created on the taskbar's own UI thread. So it
+//    moves, slides, fades and hides together with the taskbar (auto-hide,
+//    this mod's animations, fullscreen apps) with zero extra work.
+//  * Network counters are read on a separate worker thread, so a slow
+//    driver query can never stall the taskbar.
+//  * Placement is anchored to real taskbar parts: the notification area
+//    (TrayNotifyWnd), the Win10 Start/Search/Task View buttons and, on
+//    Windows 11, the Widgets button via UI Automation. Fixed offsets are
+//    only a fallback (e.g. Win11 reports an empty tray rect at startup).
+//  * Size follows the taskbar's DPI (per monitor), Windows 11 text scaling
+//    (Accessibility > Text size), light/dark/accent and high contrast.
+//  * Per-adapter deltas (keyed by LUID) avoid fake spikes when Wi-Fi or a
+//    VPN reconnects.
+//
+// Performance:
+//  * Settings are versioned. Each meter keeps its own copy and only re-copies
+//    when the version changes, so ticks never allocate or take the lock.
+//  * A frame is redrawn only when its text, colors or size changed; at idle
+//    ("0 B/s" every second) nothing is drawn or pushed to the compositor.
+//  * Pixel buffers are kept per meter and reused; the halo uses a separable
+//    (row, then column) max filter.
+//  * Timers are coalescable, so Windows can batch wake-ups to save power.
+//
+// Extending: settings live in Config + LoadConfig(); anything that changes
+// the meter's size belongs in StyleKey; anything that changes only pixels
+// is compared in Render() against the last frame (lastUp, lastText, ...).
+// The speed test is self-contained: its own section, window class and
+// thread, reached only through RequestSpeedTest().
+// =====================================================================
+
+namespace ns {
+
+enum class Pos { Right, Left };
+enum class Lines { Auto, Two, One };
+
+struct Config {
+    Pos pos = Pos::Right;
+    int gap = 6;
+    bool allMonitors = false;
+    Lines lines = Lines::Auto;
+    int fontSize = 9;
+    std::wstring fontFamily;  // filled from settings or the Windows UI font
+    int letterSpacing = 0;
+    int lineSpacing = 2;
+    bool bold = false;
+    bool autoColor = true;
+    COLORREF color = RGB(255, 255, 255);
+    bool upAuto = false, downAuto = false;
+    COLORREF upColor = RGB(0x87, 0xCE, 0xFA);    // light sky blue
+    COLORREF downColor = RGB(0x90, 0xEE, 0x90);  // light green
+    bool upLightAuto = false, downLightAuto = false;
+    COLORREF upColorLight = RGB(0x00, 0x5F, 0xB8);    // deep blue
+    COLORREF downColorLight = RGB(0x0F, 0x7B, 0x0F);  // deep green
+    int outline = 0;  // 0 auto, 1 on, 2 off
+    bool bits = false;
+    int interval = 1000;
+    std::wstring adapter;  // lowercase substring filter, empty = auto
+    bool clickTaskMgr = false;
+    bool rightMenu = true;
+    bool replaceWinTest = true;
+};
+
+SRWLOCK g_cfgLock = SRWLOCK_INIT;
+Config g_cfg;
+std::atomic<unsigned> g_cfgVer{1};    // bumped on every settings load
+std::atomic<unsigned> g_stateVer{1};  // bumped on theme/DPI/system changes
+
+Config GetConfig() {
+    AcquireSRWLockShared(&g_cfgLock);
+    Config c = g_cfg;
+    ReleaseSRWLockShared(&g_cfgLock);
+    return c;
+}
+
+std::atomic<double> g_down{0}, g_up{0};
+std::atomic<bool> g_transparency{true};
+std::atomic<bool> g_lightTaskbar{false}, g_highContrast{false},
+    g_leftAligned{false};
+std::atomic<int> g_textScale{100};
+std::atomic<bool> g_widgetsValid{false};
+std::atomic<int> g_widgetsL{0}, g_widgetsR{0};  // relative to taskbar left
+std::atomic<HWND> g_widgetsTaskbar{nullptr};
+std::atomic<bool> g_replaceWinTest{true};  // read by the ShellExecute hook
+
+constexpr UINT WM_NS_TICK = WM_APP + 0x51;
+constexpr UINT WM_NS_RELAYOUT = WM_APP + 0x52;
+constexpr UINT WM_NS_SETTINGS = WM_APP + 0x53;
+constexpr UINT WM_NS_SPEEDTEST = WM_APP + 0x54;  // host: open panel, wp = anchor
+constexpr UINT WM_NS_ST_UPDATE = WM_APP + 0x55;  // panel: test state changed
+constexpr UINT WM_NS_FLYOUT = WM_APP + 0x56;     // panel: a shell flyout opened/closed
+constexpr UINT_PTR kLayoutTimer = 1;
+constexpr UINT_PTR kSampleTimer = 1;
+const wchar_t kMeterClass[] = L"WhNetSpeedMeter_" WH_MOD_ID;
+const wchar_t kHostClass[] = L"WhNetSpeedHost_" WH_MOD_ID;
+const wchar_t kPanelClass[] = L"WhNetSpeedTest_" WH_MOD_ID;
+
+void RequestSpeedTest(HWND anchor);  // any thread; opens the speed test panel
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+inline HINSTANCE ModInstance() { return (HINSTANCE)&__ImageBase; }
+
+template <typename T>
+T Clamp(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+std::wstring Lower(std::wstring s) {
+    for (auto& ch : s) ch = (wchar_t)towlower(ch);
+    return s;
+}
+
+// Case-insensitive substring test; `needle` must already be lowercase.
+bool ContainsI(const wchar_t* hay, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < needle.size() && hay[i] &&
+               (wchar_t)towlower(hay[i]) == needle[i])
+            i++;
+        if (i == needle.size()) return true;
+    }
+    return false;
+}
+
+// Coalescable timer (Win8+): lets Windows batch wake-ups with other timers.
+// Resolved at runtime so the mod builds regardless of the SDK's
+// _WIN32_WINNT target; falls back to a plain timer.
+void SetLazyTimer(HWND h, UINT_PTR id, UINT ms) {
+    using Fn = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
+    static Fn fn = (Fn)(void*)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                             "SetCoalescableTimer");
+    if (!fn || !fn(h, id, ms, nullptr, (std::max)(ms / 10, 15u)))
+        SetTimer(h, id, ms, nullptr);
+}
+
+
+// The font Windows itself uses for UI text (message boxes, dialogs): what
+// the user's system follows. Segoe UI on stock Windows 10 and 11, or
+// whatever a localised or customised system sets.
+std::wstring SystemUiFont() {
+    NONCLIENTMETRICSW ncm = {};
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0) &&
+        ncm.lfMessageFont.lfFaceName[0])
+        return ncm.lfMessageFont.lfFaceName;
+    return L"Segoe UI";
+}
+
+// True when a font family by this exact name is installed.
+bool FontInstalled(const std::wstring& face) {
+    if (face.empty() || face.size() >= LF_FACESIZE) return false;
+    LOGFONTW lf = {};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy(lf.lfFaceName, face.c_str());
+    bool found = false;
+    HDC dc = GetDC(nullptr);
+    EnumFontFamiliesExW(
+        dc, &lf,
+        [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) -> int {
+            *(bool*)p = true;
+            return 0;
+        },
+        (LPARAM)&found, 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
+
+// ---------------- settings & system state ----------------
+
+void LoadConfig() {
+    Config c;
+
+    PCWSTR s = Wh_GetStringSetting(L"position");
+    c.pos = (s && wcscmp(s, L"left") == 0) ? Pos::Left : Pos::Right;
+    Wh_FreeStringSetting(s);
+
+    c.gap = Clamp(Wh_GetIntSetting(L"gap"), 0, 1000);
+
+    s = Wh_GetStringSetting(L"monitors");
+    c.allMonitors = s && wcscmp(s, L"all") == 0;
+    Wh_FreeStringSetting(s);
+
+    s = Wh_GetStringSetting(L"lines");
+    c.lines = !s ? Lines::Auto
+              : wcscmp(s, L"two") == 0 ? Lines::Two
+              : wcscmp(s, L"one") == 0 ? Lines::One
+                                        : Lines::Auto;
+    Wh_FreeStringSetting(s);
+
+    {
+        PCWSTR ff = Wh_GetStringSetting(L"fontFamily");
+        c.fontFamily = (ff && *ff) ? ff : SystemUiFont();
+        Wh_FreeStringSetting(ff);
+    }
+    int fs = Wh_GetIntSetting(L"fontSize");
+    c.fontSize = fs <= 0 ? 9 : Clamp(fs, 6, 24);
+    c.bold = Wh_GetIntSetting(L"bold") != 0;
+    c.letterSpacing = Clamp(Wh_GetIntSetting(L"letterSpacing"), 0, 10);
+    c.lineSpacing = Clamp(Wh_GetIntSetting(L"lineSpacing"), 0, 20);
+
+    s = Wh_GetStringSetting(L"textColor");
+    c.autoColor = true;
+    if (s && *s && _wcsicmp(s, L"auto") != 0) {
+        const wchar_t* p = (s[0] == L'#') ? s + 1 : s;
+        if (wcslen(p) == 6) {
+            unsigned long v = wcstoul(p, nullptr, 16);
+            c.color = RGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+            c.autoColor = false;
+        }
+    }
+    Wh_FreeStringSetting(s);
+
+    auto readColor = [](PCWSTR name, bool* isAuto, COLORREF* out) {
+        PCWSTR v = Wh_GetStringSetting(name);
+        *isAuto = true;
+        if (v && *v && _wcsicmp(v, L"auto") != 0) {
+            const wchar_t* p = (v[0] == L'#') ? v + 1 : v;
+            if (wcslen(p) == 6) {
+                unsigned long x = wcstoul(p, nullptr, 16);
+                *out = RGB((x >> 16) & 0xFF, (x >> 8) & 0xFF, x & 0xFF);
+                *isAuto = false;
+            }
+        }
+        Wh_FreeStringSetting(v);
+    };
+    readColor(L"upArrowColor", &c.upAuto, &c.upColor);
+    readColor(L"downArrowColor", &c.downAuto, &c.downColor);
+    readColor(L"upArrowColorLight", &c.upLightAuto, &c.upColorLight);
+    readColor(L"downArrowColorLight", &c.downLightAuto, &c.downColorLight);
+
+    s = Wh_GetStringSetting(L"contrastOutline");
+    c.outline = (s && wcscmp(s, L"on") == 0) ? 1
+                : (s && wcscmp(s, L"off") == 0) ? 2
+                                                 : 0;
+    Wh_FreeStringSetting(s);
+
+    s = Wh_GetStringSetting(L"units");
+    c.bits = s && wcscmp(s, L"bits") == 0;
+    Wh_FreeStringSetting(s);
+
+    c.interval = Clamp(Wh_GetIntSetting(L"interval"), 250, 10000);
+
+    s = Wh_GetStringSetting(L"adapter");
+    c.adapter = s ? Lower(s) : L"";
+    Wh_FreeStringSetting(s);
+
+    c.clickTaskMgr = Wh_GetIntSetting(L"clickOpensTaskManager") != 0;
+    c.rightMenu = Wh_GetIntSetting(L"rightClickMenu") != 0;
+    c.replaceWinTest = Wh_GetIntSetting(L"replaceWindowsSpeedTest") != 0;
+    g_replaceWinTest = c.replaceWinTest;
+
+    AcquireSRWLockExclusive(&g_cfgLock);
+    g_cfg = std::move(c);
+    ReleaseSRWLockExclusive(&g_cfgLock);
+    g_cfgVer.fetch_add(1);
+}
+
+DWORD RegDword(PCWSTR path, PCWSTR name, DWORD def) {
+    DWORD v = 0, size = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, path, name, RRF_RT_REG_DWORD, nullptr,
+                     &v, &size) == ERROR_SUCCESS)
+        return v;
+    return def;
+}
+
+void ReadSystemState() {
+    const wchar_t* personalize =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    // Taskbar follows the *system* (not app) mode; accent color forces dark.
+    g_lightTaskbar = RegDword(personalize, L"SystemUsesLightTheme", 0) != 0 &&
+                     RegDword(personalize, L"ColorPrevalence", 0) == 0;
+    g_transparency = RegDword(personalize, L"EnableTransparency", 1) != 0;
+
+    HIGHCONTRASTW hc = {sizeof(hc)};
+    g_highContrast =
+        SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) &&
+        (hc.dwFlags & HCF_HIGHCONTRASTON);
+
+    g_stateVer.fetch_add(1);
+    g_textScale = Clamp<int>(
+        (int)RegDword(L"Software\\Microsoft\\Accessibility", L"TextScaleFactor",
+                      100),
+        100, 225);
+
+    g_leftAligned =
+        RegDword(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\"
+                 L"Advanced",
+                 L"TaskbarAl", 1) == 0;
+}
+
+// ---------------- network sampling (worker thread) ----------------
+
+struct IfPrev {
+    ULONG64 luid;
+    ULONG64 in, out;
+};
+std::vector<IfPrev> g_prev;
+ULONG64 g_prevTick = 0;
+
+void Sample(const Config& c) {
+    PMIB_IF_TABLE2 table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || !table) return;
+
+    ULONG64 now = GetTickCount64();
+    ULONG64 dIn = 0, dOut = 0;
+    static std::vector<IfPrev> cur;  // reused between samples (worker only)
+    cur.clear();
+
+    for (ULONG i = 0; i < table->NumEntries; i++) {
+        const MIB_IF_ROW2& r = table->Table[i];
+        if (r.Type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (r.OperStatus != IfOperStatusUp) continue;
+
+        if (c.adapter.empty()) {
+            // Auto: physical adapters only, so VPN/virtual/filter layers
+            // don't double count the same bytes.
+            if (!r.InterfaceAndOperStatusFlags.HardwareInterface) continue;
+            if (r.InterfaceAndOperStatusFlags.FilterInterface) continue;
+        } else {
+            if (!ContainsI(r.Alias, c.adapter) &&
+                !ContainsI(r.Description, c.adapter))
+                continue;
+        }
+
+        cur.push_back({r.InterfaceLuid.Value, r.InOctets, r.OutOctets});
+        for (const auto& p : g_prev) {
+            if (p.luid == r.InterfaceLuid.Value) {
+                if (r.InOctets >= p.in) dIn += r.InOctets - p.in;
+                if (r.OutOctets >= p.out) dOut += r.OutOctets - p.out;
+                break;
+            }
+        }
+    }
+    FreeMibTable(table);
+
+    if (g_prevTick && now > g_prevTick) {
+        double secs = (now - g_prevTick) / 1000.0;
+        g_down = dIn / secs;
+        g_up = dOut / secs;
+    }
+    g_prev.swap(cur);
+    g_prevTick = now;
+}
+
+const wchar_t* kByteUnits[] = {L"B/s", L"KB/s", L"MB/s", L"GB/s"};
+const wchar_t* kBitUnits[] = {L"bps", L"Kbps", L"Mbps", L"Gbps"};
+
+std::wstring FormatSpeed(double bytesPerSec, bool bits) {
+    double v = bits ? bytesPerSec * 8 : bytesPerSec;
+    const wchar_t** units = bits ? kBitUnits : kByteUnits;
+    double step = bits ? 1000.0 : 1024.0;
+    int u = 0;
+    while (v >= step * 0.995 && u < 3) {
+        v /= step;
+        u++;
+    }
+    wchar_t buf[32];
+    if (u == 0 || v >= 99.95)
+        swprintf(buf, 32, L"%.0f %ls", v, units[u]);
+    else
+        swprintf(buf, 32, L"%.1f %ls", v, units[u]);
+    return buf;
+}
+
+// ---------------- Windows 11 Widgets button (UI Automation) ----------------
+
+IUIAutomation* g_uia = nullptr;
+ULONG64 g_lastUia = 0;
+
+void UpdateWidgets() {
+    ULONG64 now = GetTickCount64();
+    if (g_lastUia && now - g_lastUia < 2000) return;
+    g_lastUia = now;
+
+    HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tb || !FindWindowExW(tb, nullptr,
+                              L"Windows.UI.Composition.DesktopWindowContentBridge",
+                              nullptr)) {
+        g_widgetsValid = false;
+        return;
+    }
+    if (!g_uia &&
+        FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_IUIAutomation,
+                                (void**)&g_uia))) {
+        g_uia = nullptr;
+        return;
+    }
+
+    bool ok = false;
+    RECT r = {};
+    IUIAutomationElement* root = nullptr;
+    if (SUCCEEDED(g_uia->ElementFromHandle(tb, &root)) && root) {
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_BSTR;
+        v.bstrVal = SysAllocString(L"WidgetsButton");
+        IUIAutomationCondition* cond = nullptr;
+        g_uia->CreatePropertyCondition(UIA_AutomationIdPropertyId, v, &cond);
+        VariantClear(&v);
+        if (cond) {
+            IUIAutomationElement* el = nullptr;
+            if (SUCCEEDED(root->FindFirst(TreeScope_Descendants, cond, &el)) &&
+                el) {
+                BOOL off = TRUE;
+                if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) &&
+                    SUCCEEDED(el->get_CurrentIsOffscreen(&off)) && !off &&
+                    r.right > r.left)
+                    ok = true;
+                el->Release();
+            }
+            cond->Release();
+        }
+        root->Release();
+    }
+
+    RECT tr;
+    GetWindowRect(tb, &tr);
+    g_widgetsL = r.left - tr.left;
+    g_widgetsR = r.right - tr.left;
+    g_widgetsTaskbar = tb;
+    g_widgetsValid = ok;
+}
+
+// ---------------- the meter window (taskbar UI thread) ----------------
+
+struct StyleKey {
+    UINT dpi = 0;
+    int bandH = 0, availW = 0, pt = 0, scale = 0;
+    bool bold = false, bits = false;
+    Lines lines = Lines::Auto;
+    int letter = 0, lineGap = 0;
+    std::wstring face;
+    bool operator==(const StyleKey& o) const {
+        return face == o.face && dpi == o.dpi && bandH == o.bandH && availW == o.availW &&
+               pt == o.pt && scale == o.scale && bold == o.bold &&
+               bits == o.bits && lines == o.lines &&
+               letter == o.letter && lineGap == o.lineGap;
+    }
+};
+
+struct Meter {
+    HWND hwnd = nullptr;
+    HWND taskbar = nullptr;
+    bool primary = true;
+
+    StyleKey key;
+    bool styleValid = false;
+    HFONT font = nullptr;
+    bool twoLines = true;
+    int w = 0, h = 0, arrowW = 0, valueW = 0, lineH = 0, pad = 0;
+    int charExtra = 0, lineGap = 0;
+
+    HDC memDC = nullptr;
+    HBITMAP bmp = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    void* pixels = nullptr;
+    int bmpW = 0, bmpH = 0;
+
+    HWND rebar = nullptr;
+    bool rebarTouched = false;
+    bool rebarHoriz = true;
+    Pos rebarPos = Pos::Right;
+    int rebarOrigEdge = 0;  // client coords
+
+    RECT lastRc = {};
+
+    // Cached settings (see g_cfgVer) and last drawn frame (see RenderSig).
+    Config cfg;
+    unsigned cfgVer = 0;
+    unsigned stateVer = 0;
+    std::wstring lastUp, lastDown;
+    COLORREF lastText = CLR_INVALID, lastUpCol = CLR_INVALID,
+             lastDownCol = CLR_INVALID;
+    bool lastHalo = false;
+    bool frameValid = false;
+    std::vector<BYTE> cov, hal, tmp;  // reused pixel buffers
+};
+
+// Settings for this meter: copied only when they actually changed.
+const Config& MeterCfg(Meter* m) {
+    unsigned v = g_cfgVer.load();
+    if (m->cfgVer != v) {
+        m->cfg = GetConfig();
+        m->cfgVer = v;
+        m->frameValid = false;
+        m->styleValid = false;
+    }
+    unsigned sv = g_stateVer.load();
+    if (m->stateVer != sv) {
+        m->stateVer = sv;
+        m->frameValid = false;
+    }
+    return m->cfg;
+}
+
+// The meter uses the font chosen in settings, or the Windows UI font.
+std::wstring FontFace() {
+    std::wstring f = GetConfig().fontFamily;
+    return f.empty() ? SystemUiFont() : f;
+}
+
+void SetFont(Meter* m, int pt, UINT dpi, int scale, bool bold, bool bits) {
+    if (m->font) {
+        SelectObject(m->memDC, GetStockObject(SYSTEM_FONT));
+        DeleteObject(m->font);
+        m->font = nullptr;
+    }
+    int px = MulDiv(MulDiv(pt, scale, 100), (int)dpi, 72);
+    m->font = CreateFontW(-px, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL, FALSE,
+                          FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                          CLIP_DEFAULT_PRECIS, CLEARTYPE_NATURAL_QUALITY,
+                          VARIABLE_PITCH | FF_SWISS, FontFace().c_str());
+    SelectObject(m->memDC, m->font);
+    SetTextCharacterExtra(m->memDC, m->charExtra);
+
+    TEXTMETRICW tm;
+    GetTextMetricsW(m->memDC, &tm);
+    m->lineH = tm.tmHeight;
+
+    SIZE sz;
+    // Arrow cell = arrow glyph + a small fixed gap (not a full space).
+    GetTextExtentPoint32W(m->memDC, L"\u2193", 1, &sz);
+    m->arrowW = sz.cx + MulDiv(3, (int)dpi, 96);
+
+    const wchar_t** units = bits ? kBitUnits : kByteUnits;
+    int mx = 0;
+    for (int i = 0; i < 4; i++) {
+        std::wstring t = std::wstring(L"888.8 ") + units[i];
+        GetTextExtentPoint32W(m->memDC, t.c_str(), (int)t.size(), &sz);
+        mx = (std::max)(mx, (int)sz.cx);
+    }
+    // Safety margin: antialiased glyphs can overhang their advance width,
+    // and the last character's extra spacing must not be cut off.
+    m->valueW = mx + MulDiv(3, (int)dpi, 96) + m->charExtra;
+}
+
+// bandH: visible taskbar height (horizontal); availW: width (vertical)
+void EnsureStyle(Meter* m, const Config& c, UINT dpi, int bandH, int availW,
+                 bool win11) {
+    StyleKey k;
+    k.dpi = dpi;
+    k.bandH = bandH;
+    k.availW = availW;
+    k.pt = c.fontSize;
+    k.scale = win11 ? g_textScale.load() : 100;  // Win10 clock ignores it
+    k.bold = c.bold;
+    k.face = c.fontFamily;
+    k.bits = c.bits;
+    k.lines = c.lines;
+    k.letter = c.letterSpacing;
+    k.lineGap = c.lineSpacing;
+    if (m->styleValid && k == m->key) return;
+
+    m->pad = MulDiv(2, (int)dpi, 96);
+    m->charExtra = MulDiv(c.letterSpacing, (int)dpi, 96);
+    m->lineGap = MulDiv(c.lineSpacing, (int)dpi, 96);
+    int gapPx = MulDiv(2, (int)dpi, 96);
+
+    if (availW > 0) {
+        // Vertical taskbar: always two lines, shrink until the width fits.
+        for (int pt = c.fontSize;; pt--) {
+            SetFont(m, pt, dpi, k.scale, k.bold, c.bits);
+            if (m->arrowW + m->valueW <= availW || pt <= 6) break;
+        }
+        m->twoLines = true;
+    } else {
+        bool two = false;
+        if (c.lines != Lines::One) {
+            int minPt = c.lines == Lines::Two ? 6 : (std::max)(6, c.fontSize - 1);
+            for (int pt = c.fontSize; pt >= minPt; pt--) {
+                SetFont(m, pt, dpi, k.scale, k.bold, c.bits);
+                if (2 * m->lineH + m->lineGap <= bandH - 2 * m->pad) {
+                    two = true;
+                    break;
+                }
+            }
+            if (c.lines == Lines::Two) two = true;  // forced, smallest font
+        }
+        if (!two) SetFont(m, c.fontSize, dpi, k.scale, k.bold, c.bits);
+        m->twoLines = two;
+    }
+
+    if (m->twoLines) {
+        m->w = m->arrowW + m->valueW + gapPx;
+        m->h = 2 * m->lineH + m->lineGap;
+    } else {
+        m->w = 2 * (m->arrowW + m->valueW) + MulDiv(12, (int)dpi, 96);
+        m->h = m->lineH;
+    }
+    m->key = k;
+    m->styleValid = true;
+}
+
+COLORREF TextColor(const Config& c) {
+    if (g_highContrast) return GetSysColor(COLOR_WINDOWTEXT);
+    if (!c.autoColor) return c.color;
+    // Windows 11 TextFillColorPrimary: near-black on light, white on dark.
+    return g_lightTaskbar ? RGB(0x1B, 0x1B, 0x1B) : RGB(255, 255, 255);
+}
+
+// Arrow colors for the current tone. The pair is chosen from the actual text
+// tone, not only the registry flag, so a custom dark Text color on a light
+// taskbar also gets the deep arrow colors.
+void ArrowColors(const Config& c, COLORREF textCol, bool darkText,
+                 COLORREF* up, COLORREF* down) {
+    bool hc = g_highContrast;
+    bool upA = darkText ? c.upLightAuto : c.upAuto;
+    bool downA = darkText ? c.downLightAuto : c.downAuto;
+    *up = (hc || upA) ? textCol : (darkText ? c.upColorLight : c.upColor);
+    *down = (hc || downA) ? textCol
+                          : (darkText ? c.downColorLight : c.downColor);
+}
+
+void Render(Meter* m, const Config& c) {
+    if (!m->font || m->w <= 0 || m->h <= 0) return;
+
+    // ---- What would this frame show? Skip everything if nothing changed.
+    COLORREF textCol = TextColor(c);
+    int textLum = (GetRValue(textCol) * 299 + GetGValue(textCol) * 587 +
+                   GetBValue(textCol) * 114) / 1000;
+    bool darkText = textLum < 128;
+    COLORREF upCol, downCol;
+    ArrowColors(c, textCol, darkText, &upCol, &downCol);
+    // Halo, auto: dark see-through taskbar only. On light taskbars a halo
+    // blurs the edges of black text, and the native clock uses none.
+    bool halo = !g_highContrast &&
+                (c.outline == 1 ||
+                 (c.outline == 0 && g_transparency && !darkText));
+
+    std::wstring up = FormatSpeed(g_up, c.bits);
+    std::wstring down = FormatSpeed(g_down, c.bits);
+
+    bool sizeOk = m->bmp && m->bmpW == m->w && m->bmpH == m->h;
+    if (m->frameValid && sizeOk && up == m->lastUp && down == m->lastDown &&
+        textCol == m->lastText && upCol == m->lastUpCol &&
+        downCol == m->lastDownCol && halo == m->lastHalo)
+        return;
+
+    // ---- (Re)create the 32-bit DIB only when the size changes.
+    if (!sizeOk) {
+        if (m->bmp) {
+            SelectObject(m->memDC, m->oldBmp);
+            DeleteObject(m->bmp);
+            m->bmp = nullptr;
+        }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = m->w;
+        bi.bmiHeader.biHeight = -m->h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        m->bmp = CreateDIBSection(m->memDC, &bi, DIB_RGB_COLORS, &m->pixels,
+                                  nullptr, 0);
+        if (!m->bmp) return;
+        m->oldBmp = SelectObject(m->memDC, m->bmp);
+        m->bmpW = m->w;
+        m->bmpH = m->h;
+    }
+
+    // ---- 1) Draw the text as a coverage mask.
+    // ClearType (natural widths) is used and the three subpixel coverages are
+    // averaged into one alpha. GDI's plain grayscale mode obeys the font's
+    // gasp table, which turns smoothing OFF at taskbar sizes and leaves
+    // jagged glyphs. Dark text is drawn dark-on-white and light text
+    // light-on-black so GDI applies the right gamma for each.
+    const int W = m->w, H = m->h;
+    const size_t npx = (size_t)W * H;
+    memset(m->pixels, darkText ? 0xFF : 0x00, npx * 4);
+    SelectObject(m->memDC, m->font);
+    SetBkMode(m->memDC, TRANSPARENT);
+    SetTextColor(m->memDC, darkText ? RGB(0, 0, 0) : RGB(255, 255, 255));
+
+    const UINT f = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_NOCLIP;
+    auto drawPair = [&](RECT rc, const wchar_t* arrow, const std::wstring& v) {
+        // Arrow at the left, value starts right after it (left-aligned),
+        // so the gap is constant and the unit can never be clipped.
+        RECT ar = rc;
+        ar.right = rc.left + m->arrowW;
+        DrawTextW(m->memDC, arrow, -1, &ar, f | DT_LEFT);
+        RECT vr = rc;
+        vr.left = rc.left + m->arrowW;
+        DrawTextW(m->memDC, v.c_str(), (int)v.size(), &vr, f | DT_LEFT);
+    };
+
+    // Arrow cells get their own color: [x0, x1) x [y0, y1)
+    struct Cell { int x0, x1, y0, y1; COLORREF col; } cells[2];
+    if (m->twoLines) {
+        int top = (H - 2 * m->lineH - m->lineGap) / 2;
+        int top2 = top + m->lineH + m->lineGap;
+        drawPair({0, top, W, top + m->lineH}, L"\u2191", up);
+        drawPair({0, top2, W, top2 + m->lineH}, L"\u2193", down);
+        cells[0] = {0, m->arrowW, top, top + m->lineH, upCol};
+        cells[1] = {0, m->arrowW, top2, top2 + m->lineH, downCol};
+    } else {
+        int half = m->arrowW + m->valueW;
+        drawPair({0, 0, half, H}, L"\u2193", down);
+        drawPair({W - half, 0, W, H}, L"\u2191", up);
+        cells[0] = {0, m->arrowW, 0, H, downCol};
+        cells[1] = {W - half, W - half + m->arrowW, 0, H, upCol};
+    }
+    GdiFlush();
+
+    // ---- 2) Coverage = average of the subpixel channels.
+    BYTE* px0 = (BYTE*)m->pixels;
+    m->cov.resize(npx);
+    BYTE* cov = m->cov.data();
+    for (size_t i = 0; i < npx; i++) {
+        const BYTE* q = px0 + i * 4;
+        int avg = (q[0] + q[1] + q[2] + 1) / 3;
+        cov[i] = (BYTE)(darkText ? 255 - avg : avg);
+    }
+
+    // ---- 3) Optional soft halo (3x3 max, separable) in the opposite tone,
+    //         so text stays legible over a busy see-through taskbar.
+    BYTE* hal = nullptr;
+    if (halo) {
+        m->tmp.resize(npx);
+        m->hal.resize(npx);
+        BYTE* tmp = m->tmp.data();
+        hal = m->hal.data();
+        for (int y = 0; y < H; y++) {  // horizontal pass
+            const BYTE* r = cov + (size_t)y * W;
+            BYTE* o = tmp + (size_t)y * W;
+            for (int x = 0; x < W; x++) {
+                BYTE v = r[x];
+                if (x > 0 && r[x - 1] > v) v = r[x - 1];
+                if (x + 1 < W && r[x + 1] > v) v = r[x + 1];
+                o[x] = v;
+            }
+        }
+        for (int y = 0; y < H; y++) {  // vertical pass, scaled to ~35%
+            const BYTE* a = tmp + (size_t)(y > 0 ? y - 1 : y) * W;
+            const BYTE* b = tmp + (size_t)y * W;
+            const BYTE* d = tmp + (size_t)(y + 1 < H ? y + 1 : y) * W;
+            BYTE* o = hal + (size_t)y * W;
+            for (int x = 0; x < W; x++) {
+                BYTE v = (std::max)({a[x], b[x], d[x]});
+                o[x] = (BYTE)(v * 90 / 255);
+            }
+        }
+    }
+    const COLORREF haloCol = darkText ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    const int hr = GetRValue(haloCol), hg = GetGValue(haloCol),
+              hb = GetBValue(haloCol);
+
+    // ---- 4) Compose premultiplied BGRA: colored text over halo.
+    // A layered window lets clicks fall through wherever alpha is 0, so the
+    // gaps between characters would hit the taskbar (its own menu opened
+    // instead of ours). When the meter takes clicks, every pixel gets
+    // alpha 1: invisible (1/255), but the whole rectangle becomes clickable.
+    const int minA = (c.rightMenu || c.clickTaskMgr) ? 1 : 0;
+    auto composeSpan = [&](int y, int x0, int x1, COLORREF col) {
+        const int cr = GetRValue(col), cg = GetGValue(col), cb = GetBValue(col);
+        size_t i = (size_t)y * W + x0;
+        BYTE* p = px0 + i * 4;
+        for (int x = x0; x < x1; x++, i++, p += 4) {
+            int a = cov[i];
+            int h = hal ? hal[i] * (255 - a) / 255 : 0;
+            p[0] = (BYTE)((cb * a + hb * h) / 255);
+            p[1] = (BYTE)((cg * a + hg * h) / 255);
+            p[2] = (BYTE)((cr * a + hr * h) / 255);
+            p[3] = (BYTE)(a + h > minA ? a + h : minA);
+        }
+    };
+    for (int y = 0; y < H; y++) {
+        // Split the row into text-colored spans and arrow-colored spans.
+        int x = 0;
+        for (const auto& cl : cells) {
+            if (y < cl.y0 || y >= cl.y1) continue;
+            int x0 = Clamp(cl.x0, 0, W), x1 = Clamp(cl.x1, 0, W);
+            if (x0 > x) composeSpan(y, x, x0, textCol);
+            if (x1 > x0) composeSpan(y, x0, x1, cl.col);
+            x = (std::max)(x, x1);
+        }
+        if (x < W) composeSpan(y, x, W, textCol);
+    }
+
+    POINT src = {0, 0};
+    SIZE size = {W, H};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(m->hwnd, nullptr, nullptr, &size, m->memDC, &src, 0,
+                        &bf, ULW_ALPHA);
+
+    m->lastUp = std::move(up);
+    m->lastDown = std::move(down);
+    m->lastText = textCol;
+    m->lastUpCol = upCol;
+    m->lastDownCol = downCol;
+    m->lastHalo = halo;
+    m->frameValid = true;
+}
+
+bool VisibleChildRect(HWND tb, HWND child, RECT* out) {
+    if (!child || !IsWindowVisible(child)) return false;
+    GetWindowRect(child, out);
+    RECT tr, i;
+    GetWindowRect(tb, &tr);
+    return out->right > out->left && out->bottom > out->top &&
+           IntersectRect(&i, out, &tr);
+}
+
+// Win10 / ExplorerPatcher: edge right after Start, Search and Task View.
+int Win10LeftAnchor(HWND tb, bool horiz, HWND self) {
+    int edge = INT_MIN;
+    for (HWND ch = GetWindow(tb, GW_CHILD); ch; ch = GetWindow(ch, GW_HWNDNEXT)) {
+        if (ch == self) continue;
+        wchar_t cls[64];
+        if (!GetClassNameW(ch, cls, 64)) continue;
+        if (wcscmp(cls, L"Start") && wcscmp(cls, L"TrayButton") &&
+            wcscmp(cls, L"TrayDummySearchControl"))
+            continue;
+        RECT r;
+        if (VisibleChildRect(tb, ch, &r))
+            edge = (std::max)(edge, (int)(horiz ? r.right : r.bottom));
+    }
+    return edge;
+}
+
+RECT ClientRectOf(HWND parent, HWND child) {
+    RECT r;
+    GetWindowRect(child, &r);
+    MapWindowPoints(HWND_DESKTOP, parent, (POINT*)&r, 2);
+    return r;
+}
+
+// Win10 / ExplorerPatcher: shrink the task-button band so buttons never sit
+// under the meter (explorer re-lays it out at times; we re-apply).
+void AdjustRebar(Meter* m, bool horiz, Pos pos, RECT meterClient, int gap) {
+    if (!m->rebar || !IsWindow(m->rebar))
+        m->rebar = FindWindowExW(m->taskbar, nullptr, L"ReBarWindow32", nullptr);
+    if (!m->rebar || !IsWindowVisible(m->rebar)) return;
+
+    RECT r = ClientRectOf(m->taskbar, m->rebar);
+    RECT nr = r;
+    if (horiz && pos == Pos::Right && r.right > meterClient.left - gap)
+        nr.right = meterClient.left - gap;
+    else if (horiz && pos == Pos::Left && r.left < meterClient.right + gap)
+        nr.left = meterClient.right + gap;
+    else if (!horiz && pos == Pos::Right && r.bottom > meterClient.top - gap)
+        nr.bottom = meterClient.top - gap;
+    else if (!horiz && pos == Pos::Left && r.top < meterClient.bottom + gap)
+        nr.top = meterClient.bottom + gap;
+    else
+        return;
+    if (nr.right - nr.left < 1 || nr.bottom - nr.top < 1) return;
+
+    if (!m->rebarTouched || m->rebarHoriz != horiz || m->rebarPos != pos) {
+        m->rebarOrigEdge = horiz ? (pos == Pos::Right ? r.right : r.left)
+                                 : (pos == Pos::Right ? r.bottom : r.top);
+        m->rebarHoriz = horiz;
+        m->rebarPos = pos;
+        m->rebarTouched = true;
+    }
+    MoveWindow(m->rebar, nr.left, nr.top, nr.right - nr.left,
+               nr.bottom - nr.top, TRUE);
+}
+
+void RestoreRebar(Meter* m) {
+    if (!m->rebarTouched || !m->rebar || !IsWindow(m->rebar)) return;
+    RECT r = ClientRectOf(m->taskbar, m->rebar);
+    if (m->rebarHoriz) {
+        if (m->rebarPos == Pos::Right) r.right = (std::max)(r.right, (LONG)m->rebarOrigEdge);
+        else r.left = (std::min)(r.left, (LONG)m->rebarOrigEdge);
+    } else {
+        if (m->rebarPos == Pos::Right) r.bottom = (std::max)(r.bottom, (LONG)m->rebarOrigEdge);
+        else r.top = (std::min)(r.top, (LONG)m->rebarOrigEdge);
+    }
+    MoveWindow(m->rebar, r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
+    m->rebarTouched = false;
+}
+
+// Returns true when the meter's size changed (needs a re-render).
+bool Layout(Meter* m, const Config& c, bool force) {
+    HWND tb = m->taskbar;
+    if (!IsWindow(tb)) return false;
+
+    RECT tr;
+    GetWindowRect(tb, &tr);
+    int tbW = tr.right - tr.left, tbH = tr.bottom - tr.top;
+    if (tbW <= 0 || tbH <= 0) return false;
+
+    bool horiz = tbW >= tbH;
+    bool win11 = FindWindowExW(tb, nullptr,
+                               L"Windows.UI.Composition.DesktopWindowContentBridge",
+                               nullptr) != nullptr;
+    UINT dpi = GetDpiForWindow(tb);
+    if (!dpi) dpi = 96;
+    auto S = [&](int v) { return MulDiv(v, (int)dpi, 96); };
+
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST), &mi);
+
+    RECT tray = {};
+    bool trayOk = VisibleChildRect(
+        tb, FindWindowExW(tb, nullptr, L"TrayNotifyWnd", nullptr), &tray);
+
+    Pos pos = c.pos;
+    // Win11 with left-aligned icons: Start sits at the left edge.
+    if (win11 && g_leftAligned && pos == Pos::Left) pos = Pos::Right;
+
+    bool widgetsHere = win11 && g_widgetsValid && g_widgetsTaskbar.load() == tb;
+    int gap = S(c.gap);
+    int prevW = m->w, prevH = m->h;
+    int x, y;
+
+    if (horiz) {
+        int bandT, bandB;
+        if (trayOk) {
+            bandT = tray.top;
+            bandB = tray.bottom;
+        } else if (win11) {
+            // Win11 Shell_TrayWnd can include invisible padding at high DPI.
+            int vis = (std::min)(tbH, S(48));
+            bool bottomEdge = (tr.top + tr.bottom) / 2 >
+                              (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2;
+            bandT = bottomEdge ? tr.bottom - vis : tr.top;
+            bandB = bandT + vis;
+        } else {
+            bandT = tr.top;
+            bandB = tr.bottom;
+        }
+        EnsureStyle(m, c, dpi, bandB - bandT, 0, win11);
+
+        if (pos == Pos::Right) {
+            int anchor = trayOk ? tray.left
+                                : tr.right - S(win11 ? (m->primary ? 300 : 120)
+                                                     : (m->primary ? 250 : 100));
+            if (widgetsHere) {  // Widgets sits right when icons are left-aligned
+                int wl = tr.left + g_widgetsL;
+                if (wl > tr.left + tbW / 2 && wl < anchor) anchor = wl;
+            }
+            x = anchor - gap - m->w;
+        } else {
+            int anchor = tr.left;
+            if (win11) {
+                if (widgetsHere) {
+                    int wr = tr.left + g_widgetsR;
+                    if (wr < tr.left + tbW / 2) anchor = wr;
+                }
+            } else {
+                int a = Win10LeftAnchor(tb, true, m->hwnd);
+                if (a != INT_MIN) anchor = a;
+            }
+            x = anchor + gap;
+        }
+        y = bandT + ((bandB - bandT) - m->h) / 2;
+        x = Clamp<int>(x, tr.left, (std::max)((int)tr.left, (int)tr.right - m->w));
+    } else {
+        EnsureStyle(m, c, dpi, 0, tbW - S(6), win11);
+        x = tr.left + (tbW - m->w) / 2;
+        if (pos == Pos::Right) {
+            int anchor = trayOk ? tray.top : tr.bottom - S(250);
+            y = anchor - gap - m->h;
+        } else {
+            int a = win11 ? INT_MIN : Win10LeftAnchor(tb, false, m->hwnd);
+            y = (a != INT_MIN ? a : (int)tr.top) + gap;
+        }
+        y = Clamp<int>(y, tr.top, (std::max)((int)tr.top, (int)tr.bottom - m->h));
+    }
+
+    POINT pt = {x, y};
+    ScreenToClient(tb, &pt);
+    RECT want = {pt.x, pt.y, pt.x + m->w, pt.y + m->h};
+
+    if (!win11 && m->primary) AdjustRebar(m, horiz, pos, want, S(4));
+
+    bool onTop = GetWindow(tb, GW_CHILD) == m->hwnd;
+    if (force || !onTop || !EqualRect(&want, &m->lastRc)) {
+        SetWindowPos(m->hwnd, HWND_TOP, want.left, want.top, m->w, m->h,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        m->lastRc = want;
+    }
+    return force || prevW != m->w || prevH != m->h;
+}
+
+void FreeMeter(Meter* m) {
+    if (m->memDC) {
+        if (m->bmp) {
+            SelectObject(m->memDC, m->oldBmp);
+            DeleteObject(m->bmp);
+        }
+        SelectObject(m->memDC, GetStockObject(SYSTEM_FONT));
+        if (m->font) DeleteObject(m->font);
+        DeleteDC(m->memDC);
+    }
+    delete m;
+}
+
+LRESULT CALLBACK MeterProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Meter* m = (Meter*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+        case WM_NCCREATE: {
+            m = (Meter*)((CREATESTRUCTW*)lp)->lpCreateParams;
+            m->hwnd = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)m);
+            break;
+        }
+        case WM_NS_TICK:
+            // Nothing to do while the taskbar itself is hidden.
+            if (m && IsWindowVisible(m->taskbar)) {
+                const Config& c = MeterCfg(m);
+                Layout(m, c, false);
+                Render(m, c);  // no-op when the text didn't change
+            }
+            return 0;
+        case WM_NS_RELAYOUT:
+            if (m) {
+                const Config& c = MeterCfg(m);
+                m->styleValid = false;
+                m->frameValid = false;
+                Layout(m, c, true);
+                Render(m, c);
+            }
+            return 0;
+        case WM_TIMER:
+            if (m && wp == kLayoutTimer && IsWindowVisible(m->taskbar)) {
+                const Config& c = MeterCfg(m);
+                if (Layout(m, c, false)) Render(m, c);
+            }
+            return 0;
+        case WM_NCHITTEST:
+            if (!m) return HTTRANSPARENT;
+            return (MeterCfg(m).clickTaskMgr || MeterCfg(m).rightMenu)
+                       ? HTCLIENT
+                       : HTTRANSPARENT;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        case WM_LBUTTONUP:
+            if (m && MeterCfg(m).clickTaskMgr)
+                ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr,
+                              nullptr, SW_SHOWNORMAL);
+            return 0;
+        case WM_RBUTTONUP:
+            if (m && MeterCfg(m).rightMenu) {
+                enum { kTest = 1, kTaskMgr, kNetSettings };
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, kTest, L"Run speed test");
+                AppendMenuW(menu, MF_STRING, kTaskMgr, L"Task Manager");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, kNetSettings, L"Network settings");
+                SetMenuDefaultItem(menu, kTest, FALSE);
+                POINT pt;
+                GetCursorPos(&pt);
+                SetForegroundWindow(GetAncestor(hwnd, GA_ROOT));
+                int cmd = TrackPopupMenuEx(
+                    menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                    pt.x, pt.y, hwnd, nullptr);
+                DestroyMenu(menu);
+                PostMessageW(hwnd, WM_NULL, 0, 0);
+                if (cmd == kTest)
+                    RequestSpeedTest(hwnd);
+                else if (cmd == kTaskMgr)
+                    ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr,
+                                  nullptr, SW_SHOWNORMAL);
+                else if (cmd == kNetSettings)
+                    ShellExecuteW(nullptr, L"open", L"ms-settings:network-status",
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+                return 0;
+            }
+            break;
+        case WM_DESTROY:
+            KillTimer(hwnd, kLayoutTimer);
+            if (m) RestoreRebar(m);
+            return 0;
+        case WM_NCDESTROY:
+            if (m) {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                FreeMeter(m);
+            }
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Run code on the thread that owns hWnd (the taskbar UI thread).
+using RunProc_t = void(WINAPI*)(void*);
+bool RunFromWindowThread(HWND hWnd, RunProc_t proc, void* param) {
+    static const UINT runMsg =
+        RegisterWindowMessageW(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+    struct Param {
+        RunProc_t proc;
+        void* param;
+    };
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(hWnd, &pid);
+    if (!tid || pid != GetCurrentProcessId()) return false;
+    if (tid == GetCurrentThreadId()) {
+        proc(param);
+        return true;
+    }
+    HHOOK hook = SetWindowsHookExW(
+        WH_CALLWNDPROC,
+        [](int code, WPARAM wp, LPARAM lp) -> LRESULT {
+            if (code == HC_ACTION) {
+                const CWPSTRUCT* cwp = (const CWPSTRUCT*)lp;
+                if (cwp->message == runMsg) {
+                    Param* p = (Param*)cwp->lParam;
+                    p->proc(p->param);
+                }
+            }
+            return CallNextHookEx(nullptr, code, wp, lp);
+        },
+        nullptr, tid);
+    if (!hook) return false;
+    Param p = {proc, param};
+    SendMessageW(hWnd, runMsg, 0, (LPARAM)&p);
+    UnhookWindowsHookEx(hook);
+    return true;
+}
+
+struct CreateParam {
+    HWND taskbar;
+    bool primary;
+    HWND result;
+};
+
+void WINAPI CreateMeterOnTaskbarThread(void* param) {
+    auto* cp = (CreateParam*)param;
+    Meter* m = new Meter;
+    m->taskbar = cp->taskbar;
+    m->primary = cp->primary;
+    m->memDC = CreateCompatibleDC(nullptr);
+
+    HWND h = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE, kMeterClass,
+                             L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 1, 1,
+                             cp->taskbar, nullptr, ModInstance(), m);
+    if (!h) {
+        Wh_Log(L"NetSpeed: CreateWindowEx failed: %u", GetLastError());
+        return;  // if WM_NCCREATE ran, WM_NCDESTROY already freed m
+    }
+    SetLazyTimer(h, kLayoutTimer, 250);
+    const Config& c = MeterCfg(m);
+    Layout(m, c, true);
+    Render(m, c);
+    ShowWindow(h, SW_SHOWNA);
+    cp->result = h;
+}
+
+// ---------------- host / worker thread ----------------
+
+HANDLE g_worker = nullptr;
+HANDLE g_workerReady = nullptr;
+std::atomic<HWND> g_host{nullptr};
+UINT g_taskbarCreatedMsg = 0;
+struct MeterRef {
+    HWND taskbar;
+    HWND meter;
+};
+std::vector<MeterRef> g_meters;  // worker thread only
+
+void Broadcast(UINT msg) {
+    for (auto& r : g_meters) PostMessageW(r.meter, msg, 0, 0);
+}
+
+void DestroyAllMeters() {
+    for (auto& r : g_meters)
+        if (IsWindow(r.meter)) SendMessageW(r.meter, WM_CLOSE, 0, 0);
+    g_meters.clear();
+}
+
+void EnsureMeters(const Config& c) {
+    std::vector<std::pair<HWND, bool>> want;
+    if (HWND p = FindWindowW(L"Shell_TrayWnd", nullptr)) want.push_back({p, true});
+    if (c.allMonitors) {
+        HWND s = nullptr;
+        while ((s = FindWindowExW(nullptr, s, L"Shell_SecondaryTrayWnd", nullptr)))
+            want.push_back({s, false});
+    }
+
+    for (auto it = g_meters.begin(); it != g_meters.end();) {
+        bool wanted = false;
+        for (auto& w : want) wanted |= (w.first == it->taskbar);
+        if (!IsWindow(it->meter) || GetParent(it->meter) != it->taskbar) {
+            it = g_meters.erase(it);
+        } else if (!wanted) {
+            SendMessageW(it->meter, WM_CLOSE, 0, 0);
+            it = g_meters.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto& w : want) {
+        bool have = false;
+        for (auto& r : g_meters) have |= (r.taskbar == w.first);
+        if (have) continue;
+        CreateParam cp = {w.first, w.second, nullptr};
+        if (RunFromWindowThread(w.first, CreateMeterOnTaskbarThread, &cp) &&
+            cp.result)
+            g_meters.push_back({w.first, cp.result});
+    }
+}
+
+void Tick() {
+    Config c = GetConfig();
+    Sample(c);
+    if (c.pos == Pos::Left || g_leftAligned) UpdateWidgets();
+    EnsureMeters(c);
+    Broadcast(WM_NS_TICK);
+}
+
+// ---------------- native speed test (host thread + test threads) ----------
+// Measures against Cloudflare's speed test endpoints (speed.cloudflare.com),
+// served from the nearest Cloudflare data center:
+//   ping/jitter: 12 tiny requests on one warm connection (first 2 dropped)
+//   download:    6 parallel streams for 10 s, first 1.5 s ignored (ramp-up)
+//   upload:      4 parallel streams for 10 s, same warm-up rule
+// WinHTTP and DWM are loaded at runtime, so no extra headers or libraries
+// are needed and the include list stays untouched.
+
+namespace http {
+using HINTERNET = void*;
+constexpr DWORD kAccessAutoProxy = 4;     // WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+constexpr DWORD kAccessDefault = 0;       // WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
+constexpr DWORD kFlagSecure = 0x00800000;  // WINHTTP_FLAG_SECURE
+constexpr DWORD kFlagRefresh = 0x00000100; // WINHTTP_FLAG_REFRESH (no cache)
+constexpr DWORD kQueryStatus = 19 | 0x20000000;  // STATUS_CODE | FLAG_NUMBER
+
+struct Api {
+    bool ok = false;
+    HMODULE mod = nullptr;
+    HINTERNET(WINAPI* Open)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD) = nullptr;
+    HINTERNET(WINAPI* Connect)(HINTERNET, LPCWSTR, WORD, DWORD) = nullptr;
+    HINTERNET(WINAPI* OpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR,
+                                   LPCWSTR, LPCWSTR*, DWORD) = nullptr;
+    BOOL(WINAPI* Send)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD,
+                       DWORD_PTR) = nullptr;
+    BOOL(WINAPI* Receive)(HINTERNET, LPVOID) = nullptr;
+    BOOL(WINAPI* Read)(HINTERNET, LPVOID, DWORD, LPDWORD) = nullptr;
+    BOOL(WINAPI* Write)(HINTERNET, LPCVOID, DWORD, LPDWORD) = nullptr;
+    BOOL(WINAPI* Query)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD,
+                        LPDWORD) = nullptr;
+    BOOL(WINAPI* Timeouts)(HINTERNET, int, int, int, int) = nullptr;
+    BOOL(WINAPI* Close)(HINTERNET) = nullptr;
+};
+Api g_api;
+
+template <typename F>
+bool Bind(F& f, const char* name) {
+    f = (F)(void*)GetProcAddress(g_api.mod, name);
+    return f != nullptr;
+}
+
+const Api* Get() {  // test runner thread only
+    if (g_api.ok) return &g_api;
+    if (!g_api.mod)
+        g_api.mod = LoadLibraryExW(L"winhttp.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!g_api.mod) return nullptr;
+    g_api.ok = Bind(g_api.Open, "WinHttpOpen") &&
+               Bind(g_api.Connect, "WinHttpConnect") &&
+               Bind(g_api.OpenRequest, "WinHttpOpenRequest") &&
+               Bind(g_api.Send, "WinHttpSendRequest") &&
+               Bind(g_api.Receive, "WinHttpReceiveResponse") &&
+               Bind(g_api.Read, "WinHttpReadData") &&
+               Bind(g_api.Write, "WinHttpWriteData") &&
+               Bind(g_api.Query, "WinHttpQueryHeaders") &&
+               Bind(g_api.Timeouts, "WinHttpSetTimeouts") &&
+               Bind(g_api.Close, "WinHttpCloseHandle");
+    return g_api.ok ? &g_api : nullptr;
+}
+
+void Unload() {
+    if (g_api.mod) FreeLibrary(g_api.mod);
+    g_api = Api();
+}
+}  // namespace http
+
+enum class StPhase { Idle, Connecting, Ping, Download, Upload, Done, Failed };
+
+struct SpeedTest {
+    std::atomic<int> phase{(int)StPhase::Idle};
+    std::atomic<double> pingMs{-1}, jitterMs{-1}, downMbps{-1}, upMbps{-1};
+    std::atomic<double> live{-1};      // live value of the running phase
+    std::atomic<double> progress{0};   // 0..1 within the running phase
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> stopped{false};  // last run was stopped by the user
+    std::atomic<int> badStatus{0};     // last non-200 a download stream got
+    SRWLOCK lock = SRWLOCK_INIT;       // guards the two strings
+    std::wstring server, error;
+    HANDLE thread = nullptr;           // host thread only
+};
+SpeedTest g_st;
+std::atomic<HWND> g_panelHwnd{nullptr};
+
+const wchar_t kStHost[] = L"speed.cloudflare.com";
+const wchar_t kStAgent[] = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           L"WindhawkInternetSpeed/2.1";
+constexpr double kPhaseMs = 10000, kWarmupMs = 1500;
+// A download target: host + path. Cloudflare first; when it refuses
+// (rate-limited after a few runs, or blocked on some ISPs), Netflix's
+// Fast.com servers, which usually sit inside the ISP; CacheFly last.
+struct StTarget {
+    std::wstring host, path;
+};
+const wchar_t kFastHost[] = L"api.fast.com";
+const wchar_t kFastPath[] = L"/netflix/speedtest/v2?https=true&"
+                            L"token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=5";
+constexpr DWORD kDownBytes = 25 * 1000 * 1000;
+constexpr DWORD kUpBytes = 4 * 1024 * 1024;
+constexpr DWORD kChunk = 64 * 1024;
+BYTE g_upBuf[kChunk];  // pseudo-random, so nothing can compress it
+
+double NowMs() {
+    static LARGE_INTEGER freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000.0 / freq.QuadPart;
+}
+
+void StNotify() {
+    if (HWND p = g_panelHwnd) PostMessageW(p, WM_NS_ST_UPDATE, 0, 0);
+}
+
+void StSetPhase(StPhase p) {
+    g_st.progress = 0;
+    g_st.live = -1;
+    g_st.phase = (int)p;
+    StNotify();
+}
+
+void StFail(const wchar_t* msg) {
+    AcquireSRWLockExclusive(&g_st.lock);
+    g_st.error = msg;
+    ReleaseSRWLockExclusive(&g_st.lock);
+    StSetPhase(StPhase::Failed);
+}
+
+// One GET on an existing connection. Returns the HTTP status (0 = failed);
+// the body is appended to `body` when given.
+DWORD StGet(const http::Api& A, http::HINTERNET conn, const wchar_t* path,
+            std::string* body, double* headerMs) {
+    http::HINTERNET r = A.OpenRequest(conn, L"GET", path, nullptr, nullptr,
+                                      nullptr,
+                                      http::kFlagSecure | http::kFlagRefresh);
+    if (!r) return 0;
+    double t0 = NowMs();
+    DWORD status = 0, len = sizeof(status);
+    if (A.Send(r, nullptr, 0, nullptr, 0, 0, 0) && A.Receive(r, nullptr)) {
+        if (headerMs) *headerMs = NowMs() - t0;
+        A.Query(r, http::kQueryStatus, nullptr, &status, &len, nullptr);
+        char buf[4096];
+        DWORD rd = 0;
+        while (A.Read(r, buf, sizeof(buf), &rd) && rd) {
+            if (body && body->size() < 65536) body->append(buf, rd);
+        }
+    }
+    A.Close(r);
+    return status;
+}
+
+// A download or upload stream: loops requests until told to stop.
+struct StWorker {
+    const http::Api* api = nullptr;
+    http::HINTERNET session = nullptr;
+    bool upload = false;
+    StTarget target;  // download source
+    std::atomic<bool>* stop = nullptr;
+    std::atomic<unsigned long long>* total = nullptr;
+    std::atomic<void*> req{nullptr};  // closed by the runner to abort I/O
+    struct StShared* shared = nullptr;
+};
+
+// Everything the stream threads touch lives on the heap and is freed by
+// whoever finishes last. Before, it lived on the runner's stack: a stream
+// stuck in WinHTTP past the runner's wait read freed memory and took
+// Explorer down with it.
+struct StShared {
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned long long> total{0};
+    std::atomic<int> refs{1};  // the runner's reference
+    StWorker workers[6];
+};
+
+void StSharedRelease(StShared* s) {
+    if (s->refs.fetch_sub(1) == 1) delete s;
+}
+
+void StReleaseReq(StWorker* w) {
+    if (void* r = w->req.exchange(nullptr)) w->api->Close(r);
+}
+
+DWORD WINAPI StWorkerProc(LPVOID p) {
+    auto* w = (StWorker*)p;
+    const http::Api& A = *w->api;
+    http::HINTERNET conn = A.Connect(
+        w->session, w->upload ? kStHost : w->target.host.c_str(), 443, 0);
+    if (!conn) {
+        StSharedRelease(w->shared);
+        return 0;
+    }
+    std::vector<BYTE> buf(w->upload ? 0 : kChunk);
+    int failures = 0;
+    const wchar_t* path = w->target.path.c_str();
+
+    while (!*w->stop && failures < 5) {
+        http::HINTERNET r = A.OpenRequest(
+            conn, w->upload ? L"POST" : L"GET", w->upload ? L"/__up" : path,
+            nullptr, nullptr, nullptr, http::kFlagSecure | http::kFlagRefresh);
+        if (!r) break;
+        w->req = r;
+        bool ok;
+        if (w->upload) {
+            ok = A.Send(r, L"Content-Type: application/octet-stream", (DWORD)-1,
+                        nullptr, 0, kUpBytes, 0);
+            DWORD sent = 0;
+            while (ok && sent < kUpBytes && !*w->stop) {
+                DWORD n = (std::min)(kChunk, kUpBytes - sent), wr = 0;
+                ok = A.Write(r, g_upBuf, n, &wr) && wr;
+                sent += wr;
+                *w->total += wr;
+            }
+            if (ok && sent == kUpBytes) ok = A.Receive(r, nullptr);
+        } else {
+            ok = A.Send(r, nullptr, 0, nullptr, 0, 0, 0) && A.Receive(r, nullptr);
+            DWORD status = 0, len = sizeof(status);
+            if (ok) A.Query(r, http::kQueryStatus, nullptr, &status, &len, nullptr);
+            if (ok && status != 200 && status != 206) {
+                // An error page (429 Too Many Requests, 403...) isn't
+                // throughput: counting it is what showed 0.00 Mbps.
+                g_st.badStatus = (int)status;
+                StReleaseReq(w);
+                break;
+            }
+            DWORD rd = 0;
+            while (ok && !*w->stop) {
+                if (!A.Read(r, buf.data(), kChunk, &rd) || !rd) break;
+                *w->total += rd;
+            }
+        }
+        StReleaseReq(w);
+        if (!ok && !*w->stop) {
+            failures++;
+            Sleep(150);
+        }
+    }
+    A.Close(conn);
+    StSharedRelease(w->shared);
+    return 0;
+}
+
+void StSetServer(const wchar_t* name) {
+    AcquireSRWLockExclusive(&g_st.lock);
+    g_st.server = name;
+    ReleaseSRWLockExclusive(&g_st.lock);
+    StNotify();
+}
+
+// Asks Fast.com for its nearest Netflix servers (often inside the user's
+// ISP) and turns each into a 25 MB range request.
+std::vector<StTarget> StFastTargets(const http::Api& A, http::HINTERNET session) {
+    std::vector<StTarget> out;
+    http::HINTERNET c = A.Connect(session, kFastHost, 443, 0);
+    if (!c) return out;
+    std::string json;
+    DWORD st = StGet(A, c, kFastPath, &json, nullptr);
+    A.Close(c);
+    if (st != 200) return out;
+    const std::string key = "\"url\":\"https://";
+    for (size_t at = json.find(key); at != std::string::npos;
+         at = json.find(key, at + 1)) {
+        size_t hs = at + key.size(), slash = json.find('/', hs),
+               end = json.find('"', hs);
+        if (slash == std::string::npos || end == std::string::npos || slash > end)
+            continue;
+        std::string host = json.substr(hs, slash - hs);
+        std::string path = json.substr(slash, end - slash);
+        size_t sp = path.find("/speedtest");
+        if (sp == std::string::npos) continue;
+        path.insert(sp + 10, "/range/0-26214400");
+        // JSON may escape '&' or '/'.
+        for (size_t i; (i = path.find("\\u0026")) != std::string::npos;)
+            path.replace(i, 6, "&");
+        for (size_t i; (i = path.find("\\/")) != std::string::npos;)
+            path.replace(i, 2, "/");
+        out.push_back({std::wstring(host.begin(), host.end()),
+                       std::wstring(path.begin(), path.end())});
+        if (out.size() >= 5) break;
+    }
+    return out;
+}
+
+// Runs one throughput phase; returns Mbps after warm-up, or -1 on failure.
+double StThroughput(const http::Api& A, http::HINTERNET session, bool upload,
+                    const std::vector<StTarget>& targets = {}) {
+    const int n = upload ? 4 : 6;
+    if (!upload && targets.empty()) return -1;
+    g_st.badStatus = 0;
+    StShared* sh = new (std::nothrow) StShared;
+    if (!sh) return -1;
+    std::atomic<bool>& stop = sh->stop;
+    std::atomic<unsigned long long>& total = sh->total;
+    StWorker* workers = sh->workers;
+    HANDLE threads[6] = {};
+    int started = 0;
+    for (int i = 0; i < n; i++) {
+        workers[i].api = &A;
+        workers[i].session = session;
+        workers[i].upload = upload;
+        if (!upload) workers[i].target = targets[i % targets.size()];
+        workers[i].stop = &stop;
+        workers[i].total = &total;
+        workers[i].shared = sh;
+        sh->refs.fetch_add(1);
+        threads[started] =
+            CreateThread(nullptr, 0, StWorkerProc, &workers[i], 0, nullptr);
+        if (threads[started]) started++;
+        else sh->refs.fetch_sub(1);
+    }
+    if (!started) {
+        StSharedRelease(sh);
+        return -1;
+    }
+
+    // Sample every 100 ms; live value = last ~1 s, final = after warm-up.
+    struct Sample { double t; unsigned long long b; } hist[11] = {};
+    int histN = 0;
+    double t0 = NowMs(), warmT = -1, t = 0;
+    unsigned long long warmB = 0, b = 0;
+    while (!g_st.cancel) {
+        Sleep(100);
+        t = NowMs() - t0;
+        b = total;
+        if (warmT < 0 && t >= kWarmupMs) {
+            warmT = t;
+            warmB = b;
+        }
+        if (histN == 11) {
+            memmove(hist, hist + 1, sizeof(Sample) * 10);
+            histN = 10;
+        }
+        hist[histN++] = {t, b};
+        const Sample& old = hist[0];
+        if (t > old.t)
+            g_st.live = (b - old.b) * 8.0 / ((t - old.t) / 1000.0) / 1e6;
+        g_st.progress = (std::min)(1.0, t / kPhaseMs);
+        StNotify();
+        if (t >= kPhaseMs) break;
+    }
+
+    stop = true;
+    for (int i = 0; i < n; i++) StReleaseReq(&workers[i]);  // abort blocked I/O
+    WaitForMultipleObjects(started, threads, TRUE, 15000);
+    for (int i = 0; i < started; i++) CloseHandle(threads[i]);
+    for (int i = 0; i < n; i++) StReleaseReq(&workers[i]);  // late opens
+    StSharedRelease(sh);  // streams still stuck free it when they exit
+
+    if (g_st.cancel || b == 0) return -1;
+    // Every stream refused and only a trickle of error pages came back.
+    if (!upload && g_st.badStatus && b < 512 * 1024) return -1;
+    if (warmT >= 0 && t > warmT)
+        return (b - warmB) * 8.0 / ((t - warmT) / 1000.0) / 1e6;
+    return g_st.live;
+}
+
+DWORD WINAPI StRunProc(LPVOID) {
+    g_st.pingMs = g_st.jitterMs = g_st.downMbps = g_st.upMbps = -1;
+    StSetPhase(StPhase::Connecting);
+
+    const http::Api* api = http::Get();
+    if (!api) {
+        StFail(L"WinHTTP isn't available on this system");
+        return 0;
+    }
+    const http::Api& A = *api;
+    http::HINTERNET session =
+        A.Open(kStAgent, http::kAccessAutoProxy, nullptr, nullptr, 0);
+    if (!session)
+        session = A.Open(kStAgent, http::kAccessDefault, nullptr, nullptr, 0);
+    if (!session) {
+        StFail(L"Couldn't start a network session");
+        return 0;
+    }
+    A.Timeouts(session, 5000, 5000, 10000, 10000);
+    http::HINTERNET conn = A.Connect(session, kStHost, 443, 0);
+
+    // Which Cloudflare data center answers (e.g. "MAA" = Chennai).
+    std::string trace;
+    if (!conn || StGet(A, conn, L"/cdn-cgi/trace", &trace, nullptr) != 200) {
+        if (conn) A.Close(conn);
+        A.Close(session);
+        if (!g_st.cancel) StFail(L"Can't reach Cloudflare. Check your connection.");
+        else {
+            g_st.stopped = true;
+            StSetPhase(StPhase::Idle);
+        }
+        return 0;
+    }
+    std::wstring server = L"Cloudflare";
+    size_t at = trace.find("colo=");
+    if (at != std::string::npos) {
+        size_t end = trace.find('\n', at);
+        std::string colo = trace.substr(at + 5, end - at - 5);
+        if (!colo.empty() && colo.size() < 8)
+            server += L" " + std::wstring(colo.begin(), colo.end());
+    }
+    AcquireSRWLockExclusive(&g_st.lock);
+    g_st.server = server;
+    g_st.error.clear();
+    ReleaseSRWLockExclusive(&g_st.lock);
+
+    // ---- ping & jitter
+    StSetPhase(StPhase::Ping);
+    std::vector<double> rtt;
+    for (int i = 0; i < 12 && !g_st.cancel; i++) {
+        double ms = 0;
+        // The trace page is tiny and not rate-limited like /__down, which
+        // is saved for the download itself.
+        if (StGet(A, conn, L"/cdn-cgi/trace", nullptr, &ms) == 200 && i >= 2) {
+            rtt.push_back(ms);
+            g_st.live = ms;
+        }
+        g_st.progress = (i + 1) / 12.0;
+        StNotify();
+    }
+    A.Close(conn);
+    if (!rtt.empty()) {
+        double jit = 0;
+        for (size_t i = 1; i < rtt.size(); i++) { double d = rtt[i] - rtt[i - 1]; jit += d < 0 ? -d : d; }
+        g_st.jitterMs = rtt.size() > 1 ? jit / (rtt.size() - 1) : 0;
+        std::vector<double> sorted = rtt;
+        std::sort(sorted.begin(), sorted.end());
+        g_st.pingMs = sorted[sorted.size() / 2];  // median
+    }
+
+    // ---- download, then upload
+    if (!g_st.cancel) {
+        StSetPhase(StPhase::Download);
+        double mbps = -1;
+        wchar_t cfPath[64];
+        swprintf(cfPath, 64, L"/__down?bytes=%lu", (unsigned long)kDownBytes);
+        if (http::HINTERNET c = A.Connect(session, kStHost, 443, 0)) {
+            DWORD st = StGet(A, c, L"/__down?bytes=1000", nullptr, nullptr);
+            A.Close(c);
+            if (st == 200)
+                mbps = StThroughput(A, session, false, {{kStHost, cfPath}});
+        }
+        if (mbps < 0 && !g_st.cancel) {
+            // Cloudflare refused: use Netflix's Fast.com servers.
+            std::vector<StTarget> t = StFastTargets(A, session);
+            if (!t.empty()) {
+                StSetServer(L"Netflix Fast.com");
+                StSetPhase(StPhase::Download);
+                mbps = StThroughput(A, session, false, t);
+            }
+        }
+        if (mbps < 0 && !g_st.cancel) {
+            StSetServer(L"CacheFly");
+            StSetPhase(StPhase::Download);
+            mbps = StThroughput(A, session, false,
+                                {{L"cachefly.cachefly.net", L"/100mb.test"}});
+        }
+        g_st.downMbps = mbps;
+        StSetServer(server.c_str());  // upload runs against Cloudflare
+    }
+    if (!g_st.cancel) {
+        StSetPhase(StPhase::Upload);
+        g_st.upMbps = StThroughput(A, session, true);
+    }
+    A.Close(session);
+
+    if (g_st.cancel) {
+        g_st.stopped = true;
+        StSetPhase(StPhase::Idle);
+    }
+    else if (g_st.downMbps < 0 && g_st.upMbps < 0 && g_st.badStatus)
+        StFail(L"The test servers refused the connection. Try again later.");
+    else if (g_st.downMbps < 0 && g_st.upMbps < 0)
+        StFail(L"The test was interrupted. Check your connection.");
+    else
+        StSetPhase(StPhase::Done);
+    return 0;
+}
+
+bool StRunning() {
+    return g_st.thread && WaitForSingleObject(g_st.thread, 0) == WAIT_TIMEOUT;
+}
+
+void StStart() {  // host thread
+    if (StRunning()) return;
+    if (g_st.thread) {
+        CloseHandle(g_st.thread);
+        g_st.thread = nullptr;
+    }
+    static bool seeded = false;
+    if (!seeded) {
+        unsigned x = GetTickCount() | 1;
+        for (BYTE& v : g_upBuf) {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            v = (BYTE)x;
+        }
+        seeded = true;
+    }
+    g_st.cancel = false;
+    g_st.stopped = false;
+    g_st.thread = CreateThread(nullptr, 0, StRunProc, nullptr, 0, nullptr);
+}
+
+void StStop(bool wait) {  // host thread
+    g_st.cancel = true;
+    if (!wait) g_st.stopped = true;  // user pressed Stop
+    if (wait && g_st.thread) {
+        WaitForSingleObject(g_st.thread, 20000);
+        CloseHandle(g_st.thread);
+        g_st.thread = nullptr;
+    }
+}
+
+// ---- vector drawing (no Direct2D: keeps the include list untouched) ----
+//
+// The panel is painted in software into a premultiplied 32-bit buffer:
+//  * shapes are polygons filled with the nonzero rule, 4 sub-scanlines per
+//    pixel with exact horizontal coverage, so edges are as smooth as D2D's;
+//  * icons are real SVG source (viewBox 24, path data incl. arcs), parsed
+//    once and rendered as vectors at any DPI: never bitmaps;
+//  * text comes from GDI ClearType and is folded into alpha, so it stays
+//    crisp over both the solid surface and the acrylic backdrop.
+// Alpha is kept so DWM can show the acrylic backdrop through the surface.
+
+namespace gfx {
+
+inline float Sqrt(float v) { return __builtin_sqrtf(v); }
+inline float Sin(float v) { return __builtin_sinf(v); }
+inline float Cos(float v) { return __builtin_cosf(v); }
+inline float Pow(float a, float b) { return __builtin_powf(a, b); }
+constexpr float kPi = 3.14159265f;
+
+struct Pt {
+    float x, y;
+};
+using Poly = std::vector<Pt>;
+using Shape = std::vector<Poly>;
+
+struct Rgba {  // straight alpha, 0..1
+    float r, g, b, a;
+};
+inline Rgba C(COLORREF c, float a = 1) {
+    return {GetRValue(c) / 255.f, GetGValue(c) / 255.f, GetBValue(c) / 255.f, a};
+}
+inline Rgba WithA(Rgba c, float a) { return {c.r, c.g, c.b, c.a * a}; }
+inline Rgba Lerp(Rgba a, Rgba b, float t) {
+    return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t,
+            a.a + (b.a - a.a) * t};
+}
+inline float Luma(Rgba c) { return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
+
+struct Canvas {
+    BYTE* px = nullptr;  // BGRA, premultiplied, top-down
+    int w = 0, h = 0;
+};
+
+inline void BlendPx(BYTE* d, const Rgba& c, float cov) {
+    float a = c.a * cov;
+    if (a <= 0.002f) return;
+    float ia = 1 - a;
+    d[0] = (BYTE)(c.b * a * 255 + d[0] * ia + 0.5f);
+    d[1] = (BYTE)(c.g * a * 255 + d[1] * ia + 0.5f);
+    d[2] = (BYTE)(c.r * a * 255 + d[2] * ia + 0.5f);
+    d[3] = (BYTE)(a * 255 + d[3] * ia + 0.5f);
+}
+
+// Fills `s` (nonzero winding). `grad`, when set, varies the colour from
+// top (c) to bottom (c2) across the shape's bounds: used for soft surfaces.
+void Fill(Canvas& cv, const Shape& s, Rgba c, const Rgba* c2 = nullptr) {
+    // A single NaN or runaway coordinate would index far outside the
+    // canvas; such a shape is simply not drawn.
+    for (const Poly& p : s) {
+        if (p.size() > 4096) return;
+        for (const Pt& q : p)
+            if (!__builtin_isfinite(q.x) || !__builtin_isfinite(q.y) ||
+                __builtin_fabsf(q.x) > 1e5f || __builtin_fabsf(q.y) > 1e5f)
+                return;
+    }
+    if (cv.w <= 0 || cv.h <= 0 || !cv.px) return;
+    float minY = 1e9f, maxY = -1e9f, minX = 1e9f, maxX = -1e9f;
+    for (const Poly& p : s)
+        for (const Pt& q : p) {
+            minY = std::min(minY, q.y), maxY = std::max(maxY, q.y);
+            minX = std::min(minX, q.x), maxX = std::max(maxX, q.x);
+        }
+    if (minY > maxY) return;
+    int y0 = std::max(0, (int)minY), y1 = std::min(cv.h - 1, (int)maxY + 1);
+    int x0 = std::max(0, (int)minX), x1 = std::min(cv.w - 1, (int)maxX + 1);
+    if (x0 > x1) return;
+    static std::vector<float> acc;
+    static std::vector<std::pair<float, int>> xs;
+    acc.assign(cv.w + 2, 0.f);
+    for (int y = y0; y <= y1; y++) {
+        for (int i = x0; i <= x1 + 1; i++) acc[i] = 0;
+        bool any = false;
+        for (int sub = 0; sub < 4; sub++) {
+            float sy = y + (sub + 0.5f) * 0.25f;
+            xs.clear();
+            for (const Poly& p : s) {
+                size_t n = p.size();
+                for (size_t i = 0; i < n; i++) {
+                    const Pt& a = p[i];
+                    const Pt& b = p[(i + 1) % n];
+                    if ((a.y <= sy && b.y > sy) || (b.y <= sy && a.y > sy)) {
+                        float x = a.x + (sy - a.y) * (b.x - a.x) / (b.y - a.y);
+                        xs.push_back({x, b.y > a.y ? 1 : -1});
+                    }
+                }
+            }
+            if (xs.empty()) continue;
+            std::sort(xs.begin(), xs.end(),
+                      [](auto& l, auto& r) { return l.first < r.first; });
+            int wind = 0;
+            float start = 0;
+            for (auto& e : xs) {
+                int prev = wind;
+                wind += e.second;
+                if (prev == 0 && wind != 0) start = e.first;
+                else if (prev != 0 && wind == 0) {
+                    float xa = Clamp(start, 0.f, (float)cv.w);
+                    float xb = Clamp(e.first, 0.f, (float)cv.w);
+                    if (xb <= xa) continue;
+                    any = true;
+                    int ia = (int)xa, ib = (int)xb;
+                    if (ia < 0 || ib > cv.w || ia > cv.w) continue;
+                    if (ia == ib) {
+                        acc[ia] += (xb - xa) * 0.25f;
+                    } else {
+                        acc[ia] += (ia + 1 - xa) * 0.25f;
+                        for (int i = ia + 1; i < ib; i++) acc[i] += 0.25f;
+                        if (ib < cv.w) acc[ib] += (xb - ib) * 0.25f;
+                    }
+                }
+            }
+        }
+        if (!any) continue;
+        Rgba col = c;
+        if (c2 && maxY > minY) col = Lerp(c, *c2, Clamp((y - minY) / (maxY - minY), 0.f, 1.f));
+        BYTE* row = cv.px + (size_t)y * cv.w * 4;
+        for (int x = x0; x <= x1; x++)
+            if (acc[x] > 0) BlendPx(row + x * 4, col, std::min(acc[x], 1.f));
+    }
+}
+
+float Area(const Poly& p) {
+    float a = 0;
+    for (size_t i = 0, n = p.size(); i < n; i++) {
+        const Pt &u = p[i], &v = p[(i + 1) % n];
+        a += u.x * v.y - v.x * u.y;
+    }
+    return a * 0.5f;
+}
+// Same orientation for every piece, so overlapping pieces union under the
+// nonzero rule instead of cancelling.
+void Orient(Poly& p) {
+    if (Area(p) < 0) std::reverse(p.begin(), p.end());
+}
+
+Poly Circle(float cx, float cy, float r) {
+    if (!__builtin_isfinite(r) || r <= 0 || r > 4096) return Poly();
+    int n = std::max(12, std::min(512, (int)(r * 2.2f)));
+    Poly p;
+    for (int i = 0; i < n; i++) {
+        float t = 2 * kPi * i / n;
+        p.push_back({cx + r * Cos(t), cy + r * Sin(t)});
+    }
+    Orient(p);
+    return p;
+}
+
+// Continuous-curvature ("squircle") rounded rectangle, the corner shape of
+// ColorOS and iOS: a superellipse quadrant spread over 1.28x the radius,
+// so the curve eases into the straight edge instead of meeting it at a kink.
+// A true pill: straight sides and exact semicircular ends (a squircle
+// corner at full radius reads as a soft box, not a pill).
+Poly Capsule(float x, float y, float w, float h) {
+    float r = std::min(w, h) / 2;
+    if (!__builtin_isfinite(r) || r <= 0 || r > 4096) return Poly();
+    int seg = std::max(12, std::min(256, (int)(r * 1.2f)));
+    Poly p;
+    for (int i = 0; i <= seg; i++) {  // right end, top to bottom
+        float t = -kPi / 2 + kPi * i / seg;
+        p.push_back({x + w - r + r * Cos(t), y + h / 2 + r * Sin(t)});
+    }
+    for (int i = 0; i <= seg; i++) {  // left end, bottom to top
+        float t = kPi / 2 + kPi * i / seg;
+        p.push_back({x + r + r * Cos(t), y + h / 2 + r * Sin(t)});
+    }
+    Orient(p);
+    return p;
+}
+
+// The part of a convex shape left of x = xe (one Sutherland-Hodgman pass).
+// A progress fill cut from the pill keeps a straight, vertical leading edge
+// and only takes the pill's curve once it reaches the end.
+Poly ClipLeft(const Poly& in, float xe) {
+    Poly out;
+    if (!__builtin_isfinite(xe)) return out;
+    size_t n = in.size();
+    for (size_t i = 0; i < n; i++) {
+        Pt a = in[i], b = in[(i + 1) % n];
+        bool ia = a.x <= xe, ib = b.x <= xe;
+        if (ia) out.push_back(a);
+        if (ia != ib && b.x != a.x) {
+            float t = (xe - a.x) / (b.x - a.x);
+            out.push_back({xe, a.y + (b.y - a.y) * t});
+        }
+    }
+    return out;
+}
+
+Poly RoundRect(float x, float y, float w, float h, float r) {
+    r = std::min(r, std::min(w, h) / 2);
+    float e = std::min(r * 1.28f, std::min(w, h) / 2);
+    const float n = 3.4f, k = 2 / n;
+    int seg = std::max(6, (int)(e * 0.9f));
+    Poly p;
+    auto corner = [&](float cx, float cy, float sx, float sy, bool rev) {
+        for (int i = 0; i <= seg; i++) {
+            int j = rev ? seg - i : i;
+            float t = (kPi / 2) * j / seg;
+            // cos(pi/2) is a hair below zero in float: pow of it is NaN.
+            float dx = e * Pow(std::max(0.f, Cos(t)), k),
+                  dy = e * Pow(std::max(0.f, Sin(t)), k);
+            p.push_back({cx + sx * dx, cy + sy * dy});
+        }
+    };
+    corner(x + w - e, y + h - e, 1, 1, false);
+    corner(x + e, y + h - e, -1, 1, true);
+    corner(x + e, y + e, -1, -1, false);
+    corner(x + w - e, y + e, 1, -1, true);
+    Orient(p);
+    return p;
+}
+
+// Round-capped, round-joined stroke of a polyline as a union of pieces.
+void Stroke(Shape& out, const Poly& pts, float width, bool closed) {
+    float r = width / 2;
+    size_t n = pts.size();
+    if (!n) return;
+    size_t segs = closed ? n : n - 1;
+    for (size_t i = 0; i < segs; i++) {
+        Pt a = pts[i], b = pts[(i + 1) % n];
+        float dx = b.x - a.x, dy = b.y - a.y, len = Sqrt(dx * dx + dy * dy);
+        if (len < 1e-4f) continue;
+        float nx = -dy / len * r, ny = dx / len * r;
+        Poly q = {{a.x + nx, a.y + ny}, {b.x + nx, b.y + ny},
+                  {b.x - nx, b.y - ny}, {a.x - nx, a.y - ny}};
+        Orient(q);
+        out.push_back(q);
+    }
+    for (size_t i = 0; i < n; i++) {
+        out.push_back(Circle(pts[i].x, pts[i].y, r));
+    }
+}
+
+// A thick arc with round ends as one clean outline (outer edge, inner edge
+// back), so long rings have no seams between segments.
+Shape ArcBand(float cx, float cy, float r, float width, float a0, float a1) {
+    float ro = r + width / 2, ri = r - width / 2;
+    if (!__builtin_isfinite(ro) || !__builtin_isfinite(a0) || !__builtin_isfinite(a1) ||
+        ro > 4096 || a1 - a0 > 7.f || a1 < a0)
+        return Shape();
+    int n = std::max(8, std::min(1024, (int)(ro * (a1 - a0) * 0.6f)));
+    Poly p;
+    for (int i = 0; i <= n; i++) {
+        float t = a0 + (a1 - a0) * i / n;
+        p.push_back({cx + ro * Cos(t), cy + ro * Sin(t)});
+    }
+    for (int i = n; i >= 0; i--) {
+        float t = a0 + (a1 - a0) * i / n;
+        p.push_back({cx + ri * Cos(t), cy + ri * Sin(t)});
+    }
+    Orient(p);
+    Shape s = {p};
+    s.push_back(Circle(cx + r * Cos(a0), cy + r * Sin(a0), width / 2));
+    s.push_back(Circle(cx + r * Cos(a1), cy + r * Sin(a1), width / 2));
+    return s;
+}
+
+// Arc polyline, angles in radians, clockwise on screen.
+Poly Arc(float cx, float cy, float r, float a0, float a1) {
+    if (!__builtin_isfinite(r) || !__builtin_isfinite(a0) || !__builtin_isfinite(a1) ||
+        r > 4096 || a1 - a0 > 7.f || a1 < a0)
+        return Poly();
+    int n = std::max(8, std::min(1024, (int)(r * (a1 - a0) * 0.5f)));
+    Poly p;
+    for (int i = 0; i <= n; i++) {
+        float t = a0 + (a1 - a0) * i / n;
+        p.push_back({cx + r * Cos(t), cy + r * Sin(t)});
+    }
+    return p;
+}
+
+// ---- SVG icons ----
+// A tiny SVG reader for the icon set below: <svg> stroke-width, and <path>
+// d data (M L H V C S Q T A Z, absolute and relative). A path with
+// fill="currentColor" is filled, others are stroked with round caps.
+struct SvgSub {
+    Poly pts;  // viewBox units
+    bool closed = false;
+};
+struct SvgPart {
+    std::vector<SvgSub> subs;
+    bool fill = false;
+};
+struct SvgIcon {
+    std::vector<SvgPart> parts;
+    float sw = 2;
+    float vb = 24;
+};
+
+class PathReader {
+   public:
+    explicit PathReader(const std::string& d) : s(d) {}
+    bool More() {
+        Skip();
+        return i < s.size();
+    }
+    bool IsCmd() {
+        Skip();
+        return i < s.size() && ((s[i] | 0x20) >= 'a' && (s[i] | 0x20) <= 'z') &&
+               s[i] != 'e' && s[i] != 'E';
+    }
+    char Cmd() { return s[i++]; }
+    float Num() {
+        Skip();
+        const char* b = s.c_str() + i;
+        char* e = nullptr;
+        float v = std::strtof(b, &e);
+        i += (size_t)(e - b);
+        if (e == b) i++;  // malformed: never loop forever
+        return v;
+    }
+    float Flag() {  // arc flags may be packed ("011")
+        Skip();
+        return i < s.size() ? (float)(s[i++] - '0') : 0;
+    }
+
+   private:
+    void Skip() {
+        while (i < s.size() && (s[i] == ' ' || s[i] == ',' || s[i] == '\n' ||
+                                s[i] == '\t' || s[i] == '\r'))
+            i++;
+    }
+    const std::string& s;
+    size_t i = 0;
+};
+
+void AddArc(Poly& p, Pt a, float rx, float ry, float rot, bool large, bool sweep,
+            Pt b) {
+    // SVG endpoint arc -> centre parametrisation (SVG 1.1, F.6.5).
+    if (rx == 0 || ry == 0) {
+        p.push_back(b);
+        return;
+    }
+    rx = rx < 0 ? -rx : rx, ry = ry < 0 ? -ry : ry;
+    float phi = rot * kPi / 180, cp = Cos(phi), sp = Sin(phi);
+    float dx = (a.x - b.x) / 2, dy = (a.y - b.y) / 2;
+    float x1 = cp * dx + sp * dy, y1 = -sp * dx + cp * dy;
+    float lam = x1 * x1 / (rx * rx) + y1 * y1 / (ry * ry);
+    if (lam > 1) rx *= Sqrt(lam), ry *= Sqrt(lam);
+    float num = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+    float den = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+    float co = den > 0 ? Sqrt(std::max(0.f, num / den)) : 0;
+    if (large == sweep) co = -co;
+    float cxp = co * rx * y1 / ry, cyp = -co * ry * x1 / rx;
+    float cx = cp * cxp - sp * cyp + (a.x + b.x) / 2;
+    float cy = sp * cxp + cp * cyp + (a.y + b.y) / 2;
+    auto ang = [](float ux, float uy, float vx, float vy) {
+        float d = __builtin_atan2f(ux * vy - uy * vx, ux * vx + uy * vy);
+        return d;
+    };
+    float t1 = ang(1, 0, (x1 - cxp) / rx, (y1 - cyp) / ry);
+    float dt = ang((x1 - cxp) / rx, (y1 - cyp) / ry, (-x1 - cxp) / rx,
+                   (-y1 - cyp) / ry);
+    if (!sweep && dt > 0) dt -= 2 * kPi;
+    if (sweep && dt < 0) dt += 2 * kPi;
+    int n = std::max(6, (int)((dt < 0 ? -dt : dt) * 8));
+    for (int k = 1; k <= n; k++) {
+        float t = t1 + dt * k / n;
+        float ex = rx * Cos(t), ey = ry * Sin(t);
+        p.push_back({cp * ex - sp * ey + cx, sp * ex + cp * ey + cy});
+    }
+}
+
+void ParsePath(const std::string& d, SvgPart& part) {
+    PathReader r(d);
+    Pt cur = {0, 0}, start = {0, 0}, ctrl = {0, 0};
+    char cmd = 0, prev = 0;
+    SvgSub sub;
+    auto flush = [&] {
+        if (sub.pts.size() > 1) part.subs.push_back(sub);
+        sub = SvgSub();
+    };
+    auto cubic = [&](Pt p0, Pt p1, Pt p2, Pt p3) {
+        for (int k = 1; k <= 12; k++) {
+            float t = k / 12.f, u = 1 - t;
+            sub.pts.push_back(
+                {u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x,
+                 u * u * u * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * p3.y});
+        }
+    };
+    while (r.More()) {
+        if (r.IsCmd()) cmd = r.Cmd();
+        else if (!cmd) break;
+        bool rel = cmd >= 'a';
+        Pt o = rel ? cur : Pt{0, 0};
+        switch (cmd | 0x20) {
+            case 'm': {
+                flush();
+                float x = r.Num(), y = r.Num();
+                cur = start = {o.x + x, o.y + y};
+                sub.pts.push_back(cur);
+                cmd = rel ? 'l' : 'L';  // extra pairs are line-tos
+                prev = 'm';
+                continue;
+            }
+            case 'l': {
+                float x = r.Num(), y = r.Num();
+                cur = {o.x + x, o.y + y};
+                sub.pts.push_back(cur);
+                break;
+            }
+            case 'h':
+                cur.x = (rel ? cur.x : 0) + r.Num();
+                sub.pts.push_back(cur);
+                break;
+            case 'v':
+                cur.y = (rel ? cur.y : 0) + r.Num();
+                sub.pts.push_back(cur);
+                break;
+            case 'c': {
+                Pt p1 = {o.x + r.Num(), o.y + r.Num()};
+                Pt p2 = {o.x + r.Num(), o.y + r.Num()};
+                Pt p3 = {o.x + r.Num(), o.y + r.Num()};
+                cubic(cur, p1, p2, p3);
+                ctrl = p2, cur = p3;
+                break;
+            }
+            case 's': {
+                Pt p1 = (prev == 'c' || prev == 's')
+                            ? Pt{2 * cur.x - ctrl.x, 2 * cur.y - ctrl.y}
+                            : cur;
+                Pt p2 = {o.x + r.Num(), o.y + r.Num()};
+                Pt p3 = {o.x + r.Num(), o.y + r.Num()};
+                cubic(cur, p1, p2, p3);
+                ctrl = p2, cur = p3;
+                break;
+            }
+            case 'q':
+            case 't': {
+                Pt q1 = (cmd | 0x20) == 't'
+                            ? ((prev == 'q' || prev == 't')
+                                   ? Pt{2 * cur.x - ctrl.x, 2 * cur.y - ctrl.y}
+                                   : cur)
+                            : Pt{o.x + r.Num(), o.y + r.Num()};
+                Pt p3 = {o.x + r.Num(), o.y + r.Num()};
+                cubic(cur, {cur.x + 2.f / 3 * (q1.x - cur.x), cur.y + 2.f / 3 * (q1.y - cur.y)},
+                      {p3.x + 2.f / 3 * (q1.x - p3.x), p3.y + 2.f / 3 * (q1.y - p3.y)}, p3);
+                ctrl = q1, cur = p3;
+                break;
+            }
+            case 'a': {
+                float rx = r.Num(), ry = r.Num(), rot = r.Num();
+                bool large = r.Flag() != 0, sweep = r.Flag() != 0;
+                Pt b = {o.x + r.Num(), o.y + r.Num()};
+                AddArc(sub.pts, cur, rx, ry, rot, large, sweep, b);
+                cur = b;
+                break;
+            }
+            case 'z':
+                sub.closed = true;
+                cur = start;
+                flush();
+                sub.pts.push_back(cur);
+                break;
+            default:
+                return;
+        }
+        prev = (char)(cmd | 0x20);
+    }
+    flush();
+}
+
+std::string Attr(const std::string& tag, const char* name) {
+    std::string key = std::string(" ") + name + "=\"";
+    size_t p = tag.find(key);
+    if (p == std::string::npos) return {};
+    p += key.size();
+    size_t e = tag.find('"', p);
+    return e == std::string::npos ? std::string() : tag.substr(p, e - p);
+}
+
+SvgIcon ParseSvg(const char* src) {
+    SvgIcon ic;
+    std::string s = src;
+    size_t p = s.find("<svg");
+    if (p != std::string::npos) {
+        std::string tag = s.substr(p, s.find('>', p) - p);
+        std::string sw = Attr(tag, "stroke-width");
+        if (!sw.empty()) ic.sw = std::strtof(sw.c_str(), nullptr);
+        std::string vb = Attr(tag, "viewBox");
+        if (!vb.empty()) {
+            float a, b, c;
+            if (sscanf(vb.c_str(), "%f %f %f", &a, &b, &c) == 3) ic.vb = c;
+        }
+    }
+    for (p = s.find("<path"); p != std::string::npos; p = s.find("<path", p + 5)) {
+        std::string tag = s.substr(p, s.find('>', p) - p);
+        SvgPart part;
+        part.fill = Attr(tag, "fill") == "currentColor";
+        ParsePath(Attr(tag, "d"), part);
+        ic.parts.push_back(std::move(part));
+    }
+    return ic;
+}
+
+void DrawIcon(Canvas& cv, const SvgIcon& ic, float x, float y, float size, Rgba c,
+              float weight = 1) {
+    float k = size / ic.vb;
+    Shape fills, strokes;
+    for (const SvgPart& part : ic.parts)
+        for (const SvgSub& sub : part.subs) {
+            Poly q;
+            for (const Pt& p : sub.pts) q.push_back({x + p.x * k, y + p.y * k});
+            if (part.fill) {
+                fills.push_back(q);
+            } else {
+                // Keep strokes at least ~1.3 px so small icons don't fade.
+                float w = std::max(ic.sw * k * weight, 1.3f);
+                Stroke(strokes, q, w, sub.closed);
+            }
+        }
+    if (!fills.empty()) Fill(cv, fills, c);
+    if (!strokes.empty()) Fill(cv, strokes, c);
+}
+
+// The icon set, drawn for this panel on a 24-unit grid: 2-unit strokes,
+// round caps and joins, optical centring.
+namespace icons {
+const char kGauge[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M5.11 17.79A9 9 0 1 1 18.89 17.79"/><path d="M12 13.5L16.2 8.6"/>)"
+    R"(<path fill="currentColor" stroke="none" d="M13.8 13.5a1.8 1.8 0 1 1-3.6 0a1.8 1.8 0 1 1 3.6 0z"/></svg>)";
+const char kPing[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M3 12h3.5l2.5-6 4.5 12 2.5-6H21"/></svg>)";
+const char kDown[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M12 4v11.5"/><path d="M7 10.5l5 5 5-5"/><path d="M5.5 20h13"/></svg>)";
+const char kUp[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M12 15.5V4"/><path d="M7 9l5-5 5 5"/><path d="M5.5 20h13"/></svg>)";
+const char kClose[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M6.5 6.5l11 11"/><path d="M17.5 6.5l-11 11"/></svg>)";
+const char kPlay[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">)"
+    R"(<path fill="currentColor" d="M8 5.9v12.2a1.1 1.1 0 0 0 1.68.94l9.6-6.1a1.1 1.1 0 0 0 0-1.88l-9.6-6.1A1.1 1.1 0 0 0 8 5.9z"/></svg>)";
+const char kStop[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">)"
+    R"(<path fill="currentColor" d="M8.5 6.5h7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2z"/></svg>)";
+const char kAgain[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4.5v4.5h-4.5"/></svg>)";
+const char kPin[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M12 21c-3.2-3-6.5-6.6-6.5-10.5a6.5 6.5 0 0 1 13 0C18.5 14.4 15.2 18 12 21z"/>)"
+    R"(<path d="M14.2 10.5a2.2 2.2 0 1 1-4.4 0a2.2 2.2 0 1 1 4.4 0z"/></svg>)";
+const char kCheck[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M5.5 12.5l4.2 4.2L18.5 8"/></svg>)";
+const char kAlert[] =
+    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">)"
+    R"(<path d="M21 12a9 9 0 1 1-18 0a9 9 0 1 1 18 0z"/><path d="M12 7.5v5.5"/><path d="M12 16.6v.01"/></svg>)";
+}  // namespace icons
+
+}  // namespace gfx
+
+// ---- the panel window (host thread) ----
+
+struct Panel {
+    HWND hwnd = nullptr;
+    UINT dpi = 96, fontDpi = 0;
+    bool light = false;
+    bool acrylic = false;    // Transparency effects on and the backdrop took
+    bool contrast = false;   // Windows high contrast theme
+    COLORREF accent = RGB(0x00, 0x67, 0xC0);
+    HFONT fTitle = nullptr, fBody = nullptr, fSmall = nullptr, fValue = nullptr;
+    HFONT fHero = nullptr, fStrong = nullptr, fLabel = nullptr;
+    RECT btn = {}, close = {}, rerun = {};
+    int hover = 0, pressed = 0;  // 1 = button, 2 = close
+    bool tracking = false;
+    HWND taskbar = nullptr;  // the taskbar the panel is attached to
+    HWND anchor = nullptr;   // the meter that opened it (may be null)
+    int edge = 0;            // taskbar edge: 0 bottom, 1 top, 2 left, 3 right
+    double px = 0, py = 0;   // animated position
+    double vx = 0, vy = 0;   // velocity, px/s: motion carries momentum
+    bool animating = false;  // the spring loop is running
+    bool hiding = false;     // sliding back into the taskbar
+    bool settled = false;    // reached its spot; raised above the taskbar
+    HWND fgAfterTest = nullptr;  // foreground when the test ended unfocused
+    bool btnDown = false;        // mouse state seen on the previous frame
+    RECT dodge = {};         // current goal (base spot + dodge offset)
+    int pendX = 0, pendY = 0, pendN = 0;  // a dodge must hold for 2 scans
+    bool dodging = false;    // the running spring is a step-aside
+    bool forceDodge = false; // next scan applies at once (flyout event)
+    HWINEVENTHOOK evShow = nullptr, evCloak = nullptr;
+    int offX = 0, offY = 0;  // step-aside for flyouts, relative to the base
+                             // spot, so it rides along with the taskbar
+    int tick = 0;
+    // Displayed values ease toward the measured ones (critically damped,
+    // time based), so the ring and numbers glide instead of jumping.
+    double showHero = 0, showArc = 0, showProg = 0, lastEase = 0;
+    bool easing = false;
+    // Frame cache: the last rendered surface and what it showed.
+    HBITMAP surf = nullptr;
+    BYTE* surfPx = nullptr;
+    int surfW = 0, surfH = 0;
+    std::wstring lastKey;
+};
+Panel g_panel;
+
+constexpr int kPanelW = 322, kPanelH = 272;  // DIPs
+constexpr UINT_PTR kPanelTimer = 1;
+constexpr UINT_PTR kFollowTimer = 2;  // keeps the panel glued to the taskbar
+constexpr UINT kPanelFrameMs = 16;    // value easing while a test runs
+
+void PanelPlace(RECT* out);
+void PanelHide();
+void PanelRun();
+
+int PS(int v) { return MulDiv(v, (int)g_panel.dpi, 96); }
+float PF(float v) { return v * g_panel.dpi / 96.f; }
+
+COLORREF Mix(COLORREF a, COLORREF b, int pctB) {
+    return RGB((GetRValue(a) * (100 - pctB) + GetRValue(b) * pctB) / 100,
+               (GetGValue(a) * (100 - pctB) + GetGValue(b) * pctB) / 100,
+               (GetBValue(a) * (100 - pctB) + GetBValue(b) * pctB) / 100);
+}
+
+void PanelFonts() {
+    Panel& P = g_panel;
+    if (P.fontDpi == P.dpi && P.fTitle) return;
+    for (HFONT* f : {&P.fTitle, &P.fBody, &P.fSmall, &P.fValue, &P.fHero, &P.fStrong,
+                     &P.fLabel})
+        if (*f) DeleteObject(*f), *f = nullptr;
+    // The user's Windows UI font, in three weights. Families that ship
+    // their weights as separate GDI families ("Segoe UI Semibold") use those
+    // for true glyphs; otherwise GDI picks the nearest weight of the base.
+    const std::wstring base = SystemUiFont();
+    const std::wstring semi = FontInstalled(base + L" Semibold") ? base + L" Semibold" : base;
+    const std::wstring light = FontInstalled(base + L" Light") ? base + L" Light" : base;
+    auto mk = [&](float pt, int weight, const std::wstring& face) {
+        return CreateFontW(-(int)(pt * P.dpi / 72.f + 0.5f), 0, 0, 0, weight, FALSE,
+                           FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           VARIABLE_PITCH | FF_SWISS, face.c_str());
+    };
+    // Type scale: one family, three weights. Titles and tile numbers
+    // semibold, the ring's large number light, everything else regular.
+    // Four sizes only: 12 title, 9 body (labels, status, action), 7.5 dial
+    // marks and units, 14 values, plus the dial's 28 reading.
+    P.fTitle = mk(12, FW_SEMIBOLD, semi);
+    P.fBody = mk(9, FW_NORMAL, base);
+    P.fStrong = mk(9, FW_SEMIBOLD, semi);
+    P.fSmall = mk(7.5f, FW_NORMAL, base);
+    P.fLabel = mk(9, FW_NORMAL, base);
+    P.fValue = mk(13, FW_SEMIBOLD, semi);
+    P.fHero = mk(24, FW_LIGHT, light);
+    P.fontDpi = P.dpi;
+}
+
+struct PanelDwm {
+    using SetAttr = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    struct Margins {
+        int l, r, t, b;
+    };
+    using Extend = HRESULT(WINAPI*)(HWND, const Margins*);
+    SetAttr set = nullptr;
+    Extend extend = nullptr;
+    PanelDwm() {
+        if (HMODULE m = LoadLibraryExW(L"dwmapi.dll", nullptr,
+                                       LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+            set = (SetAttr)(void*)GetProcAddress(m, "DwmSetWindowAttribute");
+            extend = (Extend)(void*)GetProcAddress(m, "DwmExtendFrameIntoClientArea");
+        }
+    }
+};
+
+void PanelTheme() {
+    Panel& P = g_panel;
+    const wchar_t* personalize =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    P.light = RegDword(personalize, L"SystemUsesLightTheme", 0) != 0;
+    bool transparency = RegDword(personalize, L"EnableTransparency", 1) != 0;
+    HIGHCONTRASTW hc = {sizeof(hc)};
+    P.contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) &&
+                 (hc.dwFlags & HCF_HIGHCONTRASTON);
+    DWORD a = RegDword(L"Software\\Microsoft\\Windows\\DWM", L"AccentColor",
+                       0xFFC06700);
+    COLORREF accent = a & 0x00FFFFFF;  // stored as ABGR = COLORREF + alpha
+    // Windows uses a lighter accent shade on dark surfaces.
+    P.accent = P.light ? accent : Mix(accent, RGB(255, 255, 255), 35);
+    if (P.contrast) P.accent = GetSysColor(COLOR_HIGHLIGHT);
+
+    static PanelDwm dwm;
+    P.acrylic = false;
+    if (dwm.set && P.hwnd) {
+        BOOL dark = !P.light;
+        dwm.set(P.hwnd, 20, &dark, sizeof(dark));  // immersive dark mode
+        int round = 2;                             // DWMWCP_ROUND (Win11)
+        dwm.set(P.hwnd, 33, &round, sizeof(round));
+        // The whole client area belongs to DWM: it draws the shadow, and
+        // with Transparency effects on, the acrylic flyout backdrop (the
+        // same material as Quick Settings) shows through our alpha.
+        if (dwm.extend) {
+            PanelDwm::Margins m = {-1, -1, -1, -1};
+            dwm.extend(P.hwnd, &m);
+        }
+        // DWM system backdrops (Mica, Mica Alt, the transient acrylic) fall
+        // back to a flat grey whenever their window is inactive, and this
+        // panel never activates (it keeps keyboard focus where it was). So
+        // no system backdrop; the acrylic accent below blurs what is behind
+        // the panel whether or not it is active, as shell flyouts do.
+        int backdrop = 1;  // DWMSBT_NONE
+        dwm.set(P.hwnd, 38, &backdrop, sizeof(backdrop));
+        struct Accent {
+            int state, flags;
+            DWORD tint;
+            int anim;
+        };
+        struct CompAttr {
+            int attr;
+            void* data;
+            SIZE_T size;
+        };
+        using SetComp = BOOL(WINAPI*)(HWND, CompAttr*);
+        static SetComp setComp = (SetComp)(void*)GetProcAddress(
+            GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+        if (setComp) {
+            bool want = transparency && !P.contrast;
+            // ACCENT_ENABLE_ACRYLICBLURBEHIND; tint is AABBGGRR, near clear so
+            // our own surface layer sets the tone over the blur.
+            Accent ac = {want ? 4 : 0, 2, P.light ? 0x08F3F3F3u : 0x08181818u, 0};
+            CompAttr ca = {19, &ac, sizeof(ac)};  // WCA_ACCENT_POLICY
+            if (setComp(P.hwnd, &ca) && want) P.acrylic = true;
+        }
+    }
+    P.lastKey.clear();
+}
+
+// Glyph coverage from GDI ClearType, folded into alpha over the canvas.
+// Light text on dark gets a slight gamma lift so it keeps the same visual
+// weight as dark text on light (thin strokes otherwise look washed out).
+void PanelText(gfx::Canvas& cv, HFONT f, const std::wstring& s, RECT r, UINT fl,
+               gfx::Rgba c) {
+    int w = r.right - r.left, h = r.bottom - r.top;
+    if (w <= 0 || h <= 0 || s.empty()) return;
+    static HDC dc = nullptr;
+    static HBITMAP bmp = nullptr;
+    static BYTE* px = nullptr;
+    static int bw = 0, bh = 0;
+    if (!dc) dc = CreateCompatibleDC(nullptr);
+    if (w > bw || h > bh) {
+        if (bmp) DeleteObject(bmp);
+        bw = std::max(w, bw), bh = std::max(h, bh);
+        BITMAPINFO bi = {};
+        bi.bmiHeader = {sizeof(BITMAPINFOHEADER), bw, -bh, 1, 32, BI_RGB};
+        bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&px, nullptr, 0);
+        SelectObject(dc, bmp);
+    }
+    if (!px) return;
+    for (int y = 0; y < h; y++) memset(px + (size_t)y * bw * 4, 0, w * 4);
+    SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    RECT lr = {0, 0, w, h};
+    DrawTextW(dc, s.c_str(), (int)s.size(), &lr, fl | DT_NOPREFIX);
+    GdiFlush();
+    float gamma = gfx::Luma(c) > 0.5f ? 0.82f : 1.0f;
+    for (int y = 0; y < h; y++) {
+        int cy = r.top + y;
+        if (cy < 0 || cy >= cv.h) continue;
+        const BYTE* src = px + (size_t)y * bw * 4;
+        BYTE* dst = cv.px + (size_t)cy * cv.w * 4;
+        for (int x = 0; x < w; x++) {
+            int cx = r.left + x;
+            if (cx < 0 || cx >= cv.w) continue;
+            int sum = src[x * 4] + src[x * 4 + 1] + src[x * 4 + 2];
+            if (!sum) continue;
+            float cov = sum / 765.f;
+            if (gamma != 1.0f) cov = gfx::Pow(cov, gamma);
+            gfx::BlendPx(dst + cx * 4, c, cov);
+        }
+    }
+}
+
+int PanelTextW(HFONT f, const std::wstring& s) {
+    static HDC dc = CreateCompatibleDC(nullptr);
+    SelectObject(dc, f);
+    SIZE sz = {};
+    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &sz);
+    return sz.cx;
+}
+
+// Draws one line with its baseline at `baseline`, so mixed sizes (a value
+// and its unit) line up exactly. fl: DT_LEFT, DT_CENTER or DT_RIGHT.
+void PanelTextAt(gfx::Canvas& cv, HFONT f, const std::wstring& s, int left,
+                 int baseline, int right, gfx::Rgba c, UINT fl = DT_LEFT) {
+    static HDC dc = CreateCompatibleDC(nullptr);
+    SelectObject(dc, f);
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(dc, &tm);
+    PanelText(cv, f, s, {left, baseline - tm.tmAscent, right, baseline + tm.tmDescent},
+              fl | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS, c);
+}
+
+// Test speeds in the unit chosen in the mod's settings: bits (Mbps, Gbps)
+// or bytes (KB/s, MB/s, binary steps like the taskbar meter).
+struct SpeedText {
+    std::wstring value, unit;
+};
+SpeedText FmtSpeed(double mbps, bool bits) {
+    if (mbps < 0) return {L"\u2014", L""};
+    double v = mbps;
+    const wchar_t* unit = L"Mbps";
+    if (bits) {
+        if (v >= 1000) v /= 1000, unit = L"Gbps";
+    } else {
+        v = mbps * 1e6 / 8 / (1024.0 * 1024.0);
+        unit = L"MB/s";
+        if (v < 1) v *= 1024, unit = L"KB/s";
+    }
+    wchar_t b[32];
+    swprintf(b, 32, v < 10 ? L"%.2f" : v < 100 ? L"%.1f" : L"%.0f", v);
+    return {b, unit};
+}
+
+struct PanelIcons {
+    gfx::SvgIcon gauge, ping, down, up, close, play, stop, again, pin, check, alert;
+    PanelIcons()
+        : gauge(gfx::ParseSvg(gfx::icons::kGauge)),
+          ping(gfx::ParseSvg(gfx::icons::kPing)),
+          down(gfx::ParseSvg(gfx::icons::kDown)),
+          up(gfx::ParseSvg(gfx::icons::kUp)),
+          close(gfx::ParseSvg(gfx::icons::kClose)),
+          play(gfx::ParseSvg(gfx::icons::kPlay)),
+          stop(gfx::ParseSvg(gfx::icons::kStop)),
+          again(gfx::ParseSvg(gfx::icons::kAgain)),
+          pin(gfx::ParseSvg(gfx::icons::kPin)),
+          check(gfx::ParseSvg(gfx::icons::kCheck)),
+          alert(gfx::ParseSvg(gfx::icons::kAlert)) {}
+};
+
+// Advances the eased display values; returns true while still moving.
+bool PanelEase() {
+    Panel& P = g_panel;
+    StPhase ph = (StPhase)g_st.phase.load();
+    double hero = -1, arc = 0;
+    double live = g_st.live, ping = g_st.pingMs;
+    if (!__builtin_isfinite(live) || live > 1e7) live = -1;
+    if (!__builtin_isfinite(ping) || ping > 1e7) ping = -1;
+    auto speedArc = [](double v) {  // log scale: 1 Mbps .. 1 Gbps reads evenly
+        return v <= 0 ? 0.0 : Clamp(__builtin_log10(1 + v) / 3.0, 0.0, 1.0);
+    };
+    switch (ph) {
+        case StPhase::Ping:
+            hero = live >= 0 ? live : ping;
+            arc = g_st.progress;
+            break;
+        case StPhase::Download:
+        case StPhase::Upload:
+            hero = live;
+            arc = speedArc(live);
+            break;
+        // Done: the dial sweeps back to its start, the results stay in the
+        // tiles. (Idle/Failed fall through to 0 as well.)
+        default:
+            break;
+    }
+    double prog = (ph == StPhase::Done) ? 1.0 : (double)g_st.progress;
+    double now = NowMs();
+    double dt = P.lastEase ? Clamp((now - P.lastEase) / 1000.0, 0.0, 0.1) : 1.0;
+    P.lastEase = now;
+    double k = 1 - __builtin_exp(-dt / 0.16);  // ~160 ms time constant
+    auto step = [&](double& v, double target) {
+        if (target < 0) target = 0;
+        v += (target - v) * k;
+        if (__builtin_fabs(target - v) < 0.002 * std::max(1.0, target)) v = target;
+        return v != target;
+    };
+    // Once a test is over the dial is back at zero at once: no sweep.
+    if (ph == StPhase::Done || ph == StPhase::Idle || ph == StPhase::Failed)
+        P.showHero = P.showArc = 0;
+    for (double* v : {&P.showHero, &P.showArc, &P.showProg})
+        if (!__builtin_isfinite(*v) || *v < 0 || *v > 1e7) *v = 0;
+    if (!__builtin_isfinite(hero)) hero = 0;
+    if (!__builtin_isfinite(arc)) arc = 0;
+    if (!__builtin_isfinite(prog)) prog = 0;
+    arc = Clamp(arc, 0.0, 1.0);
+    prog = Clamp(prog, 0.0, 1.0);
+    bool moving = step(P.showHero, hero);
+    moving |= step(P.showArc, arc);
+    if (prog < P.showProg - 0.01) P.showProg = prog;  // a new phase restarts
+    moving |= step(P.showProg, prog);
+    P.easing = moving;
+    return moving;
+}
+
+void PanelPaint(HDC dc) {
+    using namespace gfx;
+    Panel& P = g_panel;
+    static PanelIcons ic;
+    PanelFonts();
+    RECT rc;
+    GetClientRect(P.hwnd, &rc);
+    const int W = rc.right, H = rc.bottom;
+    if (W <= 0 || H <= 0) return;
+
+    StPhase ph = (StPhase)g_st.phase.load();
+    bool running = ph == StPhase::Connecting || ph == StPhase::Ping ||
+                   ph == StPhase::Download || ph == StPhase::Upload;
+    AcquireSRWLockShared(&g_st.lock);
+    std::wstring server = g_st.server, error = g_st.error;
+    ReleaseSRWLockShared(&g_st.lock);
+    double ping = g_st.pingMs, jitter = g_st.jitterMs, down = g_st.downMbps,
+           up = g_st.upMbps, live = g_st.live;
+    // Never let a bad reading (NaN, inf, absurd) reach the drawing code.
+    for (double* v : {&ping, &jitter, &down, &up, &live})
+        if (!__builtin_isfinite(*v) || *v > 1e7) *v = -1;
+    const bool bits = GetConfig().bits;  // same unit as the taskbar meter
+
+    // ---- palette ----
+    // One neutral family plus the Windows accent, used sparingly (dial arc,
+    // the tile being measured, the action icon). Nothing else is tinted,
+    // so the panel looks the same before, during and after a test.
+    // Acrylic: a light tint over the system flyout material (the one Quick
+    // Settings uses) so the blur shows; cards are a neutral lift, never
+    // white over glass, which turns milky.
+    const bool L = P.light;
+    Rgba surface, surface2, cardFill, cardFill2, cardEdge, text, text2, text3;
+    if (P.contrast) {
+        surface = surface2 = C(GetSysColor(COLOR_WINDOW));
+        cardFill = cardFill2 = surface;
+        cardEdge = C(GetSysColor(COLOR_WINDOWTEXT));
+        text = text2 = text3 = C(GetSysColor(COLOR_WINDOWTEXT));
+    } else if (L) {
+        surface = P.acrylic ? C(RGB(0xF3, 0xF3, 0xF5), 0.70f) : C(RGB(0xF2, 0xF3, 0xF6));
+        surface2 = P.acrylic ? C(RGB(0xEE, 0xEF, 0xF2), 0.74f) : C(RGB(0xEC, 0xED, 0xF1));
+        cardFill = C(RGB(255, 255, 255), P.acrylic ? 0.62f : 1.f);
+        cardFill2 = C(RGB(0xFC, 0xFC, 0xFD), P.acrylic ? 0.58f : 1.f);
+        cardEdge = C(RGB(0, 0, 0), 0.07f);
+        text = C(RGB(0x16, 0x17, 0x1A));
+        text2 = C(RGB(0x16, 0x17, 0x1A), 0.62f);
+        text3 = C(RGB(0x16, 0x17, 0x1A), 0.42f);
+    } else {
+        if (P.acrylic) {
+            // Dark tint over the acrylic, like Quick Settings: the wallpaper
+            // colours come through, never a grey wash. Cards are a faint
+            // white lift with a hairline so every section reads.
+            // Matches Quick Settings over the same wallpaper: dark, but the
+            // wallpaper's hue clearly comes through.
+            surface = C(RGB(0x17, 0x18, 0x1A), 0.76f);
+            surface2 = C(RGB(0x14, 0x15, 0x17), 0.80f);
+            cardFill = C(RGB(255, 255, 255), 0.060f);
+            cardFill2 = C(RGB(255, 255, 255), 0.045f);
+            cardEdge = C(RGB(255, 255, 255), 0.10f);
+        } else {
+            // Solid: near-black surface, cards lifted a touch.
+            surface = C(RGB(0x0F, 0x10, 0x12));
+            surface2 = C(RGB(0x0C, 0x0D, 0x0F));
+            cardFill = C(RGB(0x1F, 0x20, 0x24));
+            cardFill2 = C(RGB(0x1B, 0x1C, 0x20));
+            cardEdge = C(RGB(255, 255, 255), 0.11f);
+        }
+        text = C(RGB(0xF4, 0xF5, 0xF7));
+        text2 = C(RGB(0xF4, 0xF5, 0xF7), 0.62f);
+        text3 = C(RGB(0xF4, 0xF5, 0xF7), 0.40f);
+    }
+    Rgba accent = C(P.accent);
+    // Metric colours: download and upload are the user's taskbar arrow
+    // colours (Settings, light/dark pair picked by the panel's tone), so the
+    // panel and the meter always agree. Ping has no setting; a warm amber
+    // that sits apart from both.
+    Rgba cPing, cDown, cUp;
+    {
+        COLORREF upC, downC;
+        COLORREF tc = L ? RGB(0x16, 0x17, 0x1A) : RGB(0xF4, 0xF5, 0xF7);
+        ArrowColors(GetConfig(), tc, L, &upC, &downC);
+        cDown = P.contrast ? text : C(downC);
+        cUp = P.contrast ? text : C(upC);
+        cPing = P.contrast ? text : L ? C(RGB(0xB8, 0x5C, 0x00)) : C(RGB(0xFF, 0xB8, 0x4D));
+    }
+
+    // ---- frame cache: re-render only when something visible changed ----
+    wchar_t keyBuf[256];
+    swprintf(keyBuf, 256, L"%d|%d|%d|%d|%d|%d|%d|%d|%.1f|%.4f|%.3f|%.1f|%.1f|%.1f|%.1f|%.1f|%u",
+             W, H, (int)bits, (int)ph, P.hover, P.pressed, (int)P.light, (int)P.acrylic,
+             P.showHero, P.showArc, P.showProg, ping, jitter, down, up, live, P.dpi);
+    std::wstring key = std::wstring(keyBuf) + server + L"|" + error;
+    if (P.surf && P.surfW == W && P.surfH == H && key == P.lastKey) {
+        HDC mem = CreateCompatibleDC(dc);
+        HGDIOBJ o = SelectObject(mem, P.surf);
+        BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, o);
+        DeleteDC(mem);
+        return;
+    }
+    if (!P.surf || P.surfW != W || P.surfH != H) {
+        if (P.surf) DeleteObject(P.surf);
+        BITMAPINFO bi = {};
+        bi.bmiHeader = {sizeof(BITMAPINFOHEADER), W, -H, 1, 32, BI_RGB};
+        P.surf = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&P.surfPx, nullptr, 0);
+        P.surfW = W, P.surfH = H;
+        if (!P.surf) return;
+    }
+    P.lastKey = key;
+    Canvas cv{P.surfPx, W, H};
+    memset(cv.px, 0, (size_t)W * H * 4);
+
+    // Surface: a barely-there vertical gradient gives it depth (light from
+    // above), like ColorOS's layered panels; acrylic keeps its own grain.
+    Fill(cv, {Poly{{0, 0}, {(float)W, 0}, {(float)W, (float)H}, {0, (float)H}}},
+         surface, &surface2);
+
+    auto card = [&](float x, float y, float w, float h, float r, Rgba fill,
+                    Rgba fill2, Rgba edge) {
+        // Hairline edge (1 px at any scale), then the face inset by it, with
+        // a soft top highlight: the "glass" texture of a raised layer.
+        float e = std::max(1.f, PF(1));
+        Poly outer = RoundRect(x, y, w, h, r);
+        Poly inner = RoundRect(x + e, y + e, w - 2 * e, h - 2 * e, r - e);
+        Fill(cv, {inner}, fill, &fill2);
+        std::reverse(inner.begin(), inner.end());  // a hole: edge ring only
+        Fill(cv, {outer, inner}, edge);
+    };
+
+    wchar_t tmp[128];
+
+    // Layout (DIPs): ring dial on the left, three result tiles on the right,
+    // two equal pills (status, action) along the bottom; every line sits on
+    // a baseline. An ordered grid: 14 outer margin, 10 between every card, 16 inside
+    // every card. Two equal columns; the bottom pills share them exactly.
+    const float M = PF(10), G = PF(10), RAD = PF(14);  // one spacing everywhere
+
+    // ---- header ----
+    {
+        float bs = PF(24), bx = M, by = PF(11);
+        Fill(cv, {Circle(bx + bs / 2, by + bs / 2, bs / 2)},
+             WithA(accent, L ? 0.14f : 0.20f));
+        DrawIcon(cv, ic.gauge, bx + PF(5), by + PF(5), PF(14), accent);
+        PanelTextAt(cv, P.fTitle, L"Internet speed test", (int)(bx + bs + PF(9)),
+                    PS(28), W - PS(50), text);
+        float cs = PF(26), cx = W - M - cs + PF(4), cy = PF(10);
+        P.close = {(LONG)cx, (LONG)cy, (LONG)(cx + cs), (LONG)(cy + cs)};
+        if (P.hover == 2 || P.pressed == 2)
+            Fill(cv, {Circle(cx + cs / 2, cy + cs / 2, cs / 2)},
+                 WithA(text, P.pressed == 2 ? 0.14f : 0.08f));
+        DrawIcon(cv, ic.close, cx + PF(7), cy + PF(7), PF(12), text2, 1.05f);
+    }
+
+    const float top = PF(46), bodyH = PF(168);  // three ~51-high tiles
+    // Result tiles are compact; the dial takes the rest of the row. The
+    // bottom pills keep their own equal halves.
+    // The dial is square (as wide as it is tall); the compact tiles take
+    // the rest (the window width is sized for 124-DIP tiles).
+    const float dialW = bodyH;
+
+    // ---- dial ----
+    {
+        float x = M, y = top;
+        card(x, y, dialW, bodyH, RAD, cardFill, cardFill2, cardEdge);
+        // Soft ring gauge (the v3 look): a 270-degree band with a faint
+        // glow, the reading large and light in the middle.
+        float R = PF(62), sw = PF(9), cx = x + dialW / 2, cy = y + bodyH / 2 + PF(5);
+        const float a0 = 0.75f * kPi, sweep = 1.5f * kPi;
+        // After a test the dial counts back down to its start; once it's
+        // there it shows the idle dash again.
+        bool settling = ph == StPhase::Done || ph == StPhase::Failed;
+        bool hasValue = ph == StPhase::Ping || ph == StPhase::Download ||
+                        ph == StPhase::Upload || (settling && P.showArc > 0.004);
+        Fill(cv, ArcBand(cx, cy, R, sw, a0, a0 + sweep), WithA(text, L ? 0.07f : 0.09f));
+        float f = (float)Clamp(P.showArc, 0.0, 1.0);
+        if (f > 0.002f) {
+            // The ring takes the colour of what is being measured: ping
+            // amber, then the download colour, then the upload colour.
+            Rgba ring = ph == StPhase::Ping       ? cPing
+                        : ph == StPhase::Download ? cDown
+                        : ph == StPhase::Upload   ? cUp
+                                                  : accent;
+            Fill(cv, ArcBand(cx, cy, R, sw + PF(6), a0, a0 + sweep * f),
+                 WithA(ring, L ? 0.10f : 0.16f));
+            Fill(cv, ArcBand(cx, cy, R, sw, a0, a0 + sweep * f), ring);
+        }
+        // What is being measured.
+        const wchar_t* what = L"Ready";
+        switch (ph) {
+            case StPhase::Connecting: what = L"Connecting"; break;
+            case StPhase::Ping: what = L"Ping"; break;
+            case StPhase::Download: what = L"Download"; break;
+            case StPhase::Upload: what = L"Upload"; break;
+            case StPhase::Done:
+            case StPhase::Failed: what = L"Ready"; break;
+            default: break;
+        }
+        // Reading in the centre.
+        SpeedText rd = {L"\u2014", L""};
+        if (ph == StPhase::Ping) {
+            swprintf(tmp, 128, L"%.0f", P.showHero);
+            rd = {tmp, L"ms"};
+        } else if (hasValue) {
+            rd = FmtSpeed(P.showHero, bits);
+        }
+        if (settling && hasValue) what = L"";
+        PanelTextAt(cv, P.fHero, rd.value, (int)(cx - R), (int)(cy + PF(8)),
+                    (int)(cx + R), hasValue ? text : text3, DT_CENTER);
+        // Phase above the reading, unit below it.
+        PanelTextAt(cv, P.fBody, what, (int)(cx - R), (int)(cy - PF(24)), (int)(cx + R),
+                    text2, DT_CENTER);
+        if (hasValue)
+            PanelTextAt(cv, P.fBody, rd.unit, (int)(cx - R), (int)(cy + PF(26)),
+                        (int)(cx + R), text2, DT_CENTER);
+    }
+
+    // ---- results: three tiles on the right, title on top, result below ----
+    {
+        struct Row {
+            const wchar_t* label;
+            StPhase phase;
+            double v;
+            const SvgIcon* icon;
+            Rgba hue;
+        };
+        Row rows[3] = {
+            {L"Ping", StPhase::Ping, ping, &ic.ping, cPing},
+            {L"Download", StPhase::Download, down, &ic.down, cDown},
+            {L"Upload", StPhase::Upload, up, &ic.up, cUp},
+        };
+        float x = M + dialW + G, w = W - M - x;
+        float rh = (bodyH - 2 * G) / 3, y = top;
+        for (const Row& r : rows) {
+            bool active = ph == r.phase;
+            if (active)  // the tile being measured: accent hairline + faint tint
+                card(x, y, w, rh, RAD, Lerp(cardFill, WithA(r.hue, cardFill.a), 0.10f),
+                     Lerp(cardFill2, WithA(r.hue, cardFill2.a), 0.10f), WithA(r.hue, 0.70f));
+            else
+                card(x, y, w, rh, RAD, cardFill, cardFill2, cardEdge);
+            int lx = (int)(x + PF(12)), rx = (int)(x + w - PF(12));
+            // Title row.
+            float isz = PF(13);
+            int tb = (int)(y + PF(19));
+            // Icon and title in the metric's colour: the same up/down colours
+            // the taskbar meter uses (from settings), so both always match.
+            DrawIcon(cv, *r.icon, (float)lx, tb - PF(10), isz, r.hue);
+            PanelTextAt(cv, P.fStrong, r.label, lx + (int)(isz + PF(6)), tb, rx, r.hue);
+            // Result row.
+            double v = active ? live : r.v;
+            SpeedText s = {L"\u2014", L""};
+            if (v >= 0) {
+                if (r.phase == StPhase::Ping) {
+                    swprintf(tmp, 128, L"%.0f", v);
+                    s = {tmp, L"ms"};
+                } else {
+                    s = FmtSpeed(v, bits);
+                }
+            }
+            int vb = (int)(y + rh - PF(9));
+            int vw = PanelTextW(P.fValue, s.value);
+            PanelTextAt(cv, P.fValue, s.value, lx, vb, rx, v >= 0 ? text : text3);
+            if (!s.unit.empty())
+                PanelTextAt(cv, P.fSmall, s.unit, lx + vw + PS(4), vb, rx, text2);
+            y += rh + G;
+        }
+    }
+
+    // ---- bottom: a status pill that is also the control, and a round
+    // rerun button beside it once there is something to run again ----
+    // Ready (blue) starts the test; Stop while testing; Retry (soft red)
+    // after a stop or failure; Completed (green) is a status, and the
+    // round button next to it runs the test again.
+    {
+        float h = PF(38), pw = PF(150), cs = h;
+        float y = top + bodyH + G;
+        Rgba hBlue = L ? C(RGB(0x1A, 0x5F, 0xD6)) : C(RGB(0x6E, 0xA8, 0xFF));
+        Rgba hGreen = L ? C(RGB(0x0E, 0x8A, 0x4A)) : C(RGB(0x5B, 0xD6, 0x95));
+        Rgba hRed = L ? C(RGB(0xC2, 0x41, 0x37)) : C(RGB(0xFF, 0x8E, 0x85));
+        bool stopped = !running && ph == StPhase::Idle && g_st.stopped;
+        bool done = ph == StPhase::Done;
+        const wchar_t* label = L"Ready";
+        const SvgIcon* bi = &ic.play;
+        const Rgba* hue = &hBlue;
+        if (running) {
+            label = L"Stop";
+            bi = &ic.stop;
+            hue = nullptr;
+        } else if (stopped || ph == StPhase::Failed) {
+            label = L"Retry";
+            bi = &ic.again;
+            hue = &hRed;
+        } else if (done) {
+            label = L"Completed";
+            bi = &ic.check;
+            hue = &hGreen;
+        }
+        float groupW = done ? pw + G + cs : pw;
+        float x = (W - groupW) / 2;
+        float e = std::max(1.f, PF(1));
+        auto face = [&](Poly outer, Poly inner, const Rgba* hu, float press) {
+            Rgba f1 = cardFill, f2 = cardFill2, edge = cardEdge;
+            if (hu && !P.contrast) {
+                float k = L ? 0.12f : 0.18f;
+                f1 = Lerp(f1, WithA(*hu, std::max(f1.a, 0.5f)), k);
+                f2 = Lerp(f2, WithA(*hu, std::max(f2.a, 0.5f)), k);
+                edge = WithA(*hu, 0.45f);
+            }
+            if (press > 0) {
+                Rgba hi = L ? C(RGB(0, 0, 0)) : C(RGB(255, 255, 255));
+                f1 = Lerp(f1, WithA(hi, std::max(f1.a, 0.5f)), press);
+                f2 = Lerp(f2, WithA(hi, std::max(f2.a, 0.5f)), press);
+            }
+            if (outer.size() < 3 || inner.size() < 3) return;
+            Fill(cv, {inner}, f1, &f2);
+            std::reverse(inner.begin(), inner.end());
+            Fill(cv, {outer, inner}, edge);
+        };
+
+        P.btn = {(LONG)x, (LONG)y, (LONG)(x + pw), (LONG)(y + h)};
+        float press = done ? 0.f
+                      : P.pressed == 1 ? 0.12f : P.hover == 1 ? 0.06f : 0.f;
+        face(Capsule(x, y, pw, h), Capsule(x + e, y + e, pw - 2 * e, h - 2 * e),
+             hue, press);
+        Rgba col = hue ? *hue : text;
+        float isz = PF(14), gi = PF(7);
+        int lw = PanelTextW(P.fStrong, label);
+        float sx = x + (pw - (isz + gi + lw)) / 2;
+        DrawIcon(cv, *bi, sx, y + (h - isz) / 2, isz, col);
+        PanelTextAt(cv, P.fStrong, label, (int)(sx + isz + gi),
+                    (int)(y + h / 2 + PF(4.5f)), (int)(x + pw), col);
+
+        if (done) {
+            float rx = x + pw + G;
+            P.rerun = {(LONG)rx, (LONG)y, (LONG)(rx + cs), (LONG)(y + cs)};
+            float rp = P.pressed == 3 ? 0.12f : P.hover == 3 ? 0.06f : 0.f;
+            face(Circle(rx + cs / 2, y + cs / 2, cs / 2),
+                 Circle(rx + cs / 2, y + cs / 2, cs / 2 - e), &hRed, rp);
+            float ri = PF(16);
+            DrawIcon(cv, ic.again, rx + (cs - ri) / 2, y + (cs - ri) / 2, ri, hRed);
+        } else {
+            P.rerun = {};
+        }
+    }
+
+    HDC mem = CreateCompatibleDC(dc);
+    HGDIOBJ o = SelectObject(mem, P.surf);
+    BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, o);
+    DeleteDC(mem);
+}
+
+void PanelToggleTest() {
+    if (StRunning())
+        StStop(false);
+    else
+        StStart();
+    SetTimer(g_panel.hwnd, kPanelTimer, kPanelFrameMs, nullptr);
+    InvalidateRect(g_panel.hwnd, nullptr, FALSE);
+}
+
+// Just under the taskbar in z-order, so sliding in and out of it is clipped by
+// the taskbar itself, like the shell's own flyouts.
+HWND PanelBehind() {
+    HWND tb = g_panel.taskbar;
+    return IsWindow(tb) ? tb : HWND_TOPMOST;
+}
+
+// The panel's spot pushed fully back behind the taskbar.
+RECT PanelTucked(RECT r) {
+    int d = (g_panel.edge <= 1 ? r.bottom - r.top : r.right - r.left) + PS(12);
+    switch (g_panel.edge) {
+        case 0: OffsetRect(&r, 0, d); break;
+        case 1: OffsetRect(&r, 0, -d); break;
+        case 2: OffsetRect(&r, -d, 0); break;
+        default: OffsetRect(&r, d, 0); break;
+    }
+    return r;
+}
+
+// Shell flyouts the panel should step aside for: Quick Settings, the
+// notification center/calendar, Start, Search, toasts.
+bool IsShellFlyoutPid(DWORD pid) {
+    static std::vector<std::pair<DWORD, bool>> cache;
+    for (auto& c : cache)
+        if (c.first == pid) return c.second;
+    bool yes = false;
+    if (HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        wchar_t path[MAX_PATH];
+        DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(p, 0, path, &n)) {
+            const wchar_t* name = wcsrchr(path, L'\\');
+            name = name ? name + 1 : path;
+            for (const wchar_t* f : {L"ShellExperienceHost.exe", L"ShellHost.exe",
+                                     L"StartMenuExperienceHost.exe",
+                                     L"SearchHost.exe", L"SearchApp.exe"})
+                if (!_wcsicmp(name, f)) yes = true;
+        }
+        CloseHandle(p);
+    }
+    if (cache.size() > 64) cache.clear();
+    cache.push_back({pid, yes});
+    return yes;
+}
+
+struct FlyoutScan {
+    RECT mon;
+    std::vector<RECT> rects;
+};
+
+BOOL CALLBACK CollectFlyout(HWND w, LPARAM lp) {
+    auto* s = (FlyoutScan*)lp;
+    if (w == g_panel.hwnd || !IsWindowVisible(w)) return TRUE;
+    RECT r, x;
+    if (!GetWindowRect(w, &r) || !IntersectRect(&x, &r, &s->mon)) return TRUE;
+    int mw = s->mon.right - s->mon.left, mh = s->mon.bottom - s->mon.top;
+    int rw = x.right - x.left, rh = x.bottom - x.top;
+    if (rw < 40 || rh < 40) return TRUE;
+    if (rw > mw * 7 / 10 && rh > mh * 7 / 10) return TRUE;  // full-screen hosts
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (!pid || !IsShellFlyoutPid(pid)) return TRUE;
+
+    using GetAttr = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
+    static GetAttr get = [] {
+        HMODULE dwm = LoadLibraryExW(L"dwmapi.dll", nullptr,
+                                     LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return dwm ? (GetAttr)(void*)GetProcAddress(dwm, "DwmGetWindowAttribute")
+                   : nullptr;
+    }();
+    DWORD cloaked = 0;  // DWMWA_CLOAKED: shell flyouts stay alive but cloaked
+    if (get && SUCCEEDED(get(w, 14, &cloaked, sizeof(cloaked))) && cloaked)
+        return TRUE;
+    s->rects.push_back(x);
+    return TRUE;
+}
+
+// Moves `r` along the taskbar until it overlaps no open shell flyout.
+void PanelDodge(RECT* r) {
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &mi);
+    FlyoutScan scan{mi.rcMonitor, {}};
+    EnumWindows(CollectFlyout, (LPARAM)&scan);
+    const RECT& mon = mi.rcMonitor;
+    int m = PS(12), w = r->right - r->left, h = r->bottom - r->top;
+    bool horiz = g_panel.edge <= 1;
+    for (int pass = 0; pass < 6; pass++) {
+        bool moved = false;
+        for (const RECT& f : scan.rects) {
+            RECT g = f, x;
+            InflateRect(&g, m / 2, m / 2);
+            if (!IntersectRect(&x, &g, r)) continue;
+            // Step to whichever side of the flyout fits on screen, the
+            // nearer one when both do. Never off the edge: that is how it
+            // ended up hidden behind the notification center.
+            if (horiz) {
+                int a = f.left - m - w, b = f.right + m;
+                bool fa = a >= mon.left + m, fb = b + w <= mon.right - m;
+                int nx = fa && fb ? (abs(a - r->left) <= abs(b - r->left) ? a : b)
+                         : fa     ? a
+                         : fb     ? b
+                                  : (int)mon.left + m;
+                OffsetRect(r, nx - r->left, 0);
+            } else {
+                int a = f.top - m - h, b = f.bottom + m;
+                bool fa = a >= mon.top + m, fb = b + h <= mon.bottom - m;
+                int ny = fa && fb ? (abs(a - r->top) <= abs(b - r->top) ? a : b)
+                         : fa     ? a
+                         : fb     ? b
+                                  : (int)mon.top + m;
+                OffsetRect(r, 0, ny - r->top);
+            }
+            moved = true;
+        }
+        if (!moved) break;
+    }
+}
+
+// Shell flyouts are pre-created and cloaked; opening one uncloaks it, and
+// its window already has its final rect at that moment. Listening for that
+// lets the panel start stepping aside on the very same frame the flyout
+// starts its open animation, instead of discovering it a scan later.
+void CALLBACK FlyoutEvent(HWINEVENTHOOK, DWORD, HWND w, LONG obj, LONG child,
+                          DWORD, DWORD) {
+    if (obj != OBJID_WINDOW || child != CHILDID_SELF || !w) return;
+    if (GetAncestor(w, GA_ROOT) != w) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid && IsShellFlyoutPid(pid) && g_panel.hwnd)
+        PostMessageW(g_panel.hwnd, WM_NS_FLYOUT, 0, 0);
+}
+
+void PanelWatchFlyouts(bool on) {
+    Panel& P = g_panel;
+    if (on && !P.evShow) {
+        P.evShow = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, nullptr,
+                                   FlyoutEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+        P.evCloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED,
+                                    nullptr, FlyoutEvent, 0, 0,
+                                    WINEVENT_OUTOFCONTEXT);
+    } else if (!on) {
+        if (P.evShow) UnhookWinEvent(P.evShow);
+        if (P.evCloak) UnhookWinEvent(P.evCloak);
+        P.evShow = P.evCloak = nullptr;
+    }
+}
+
+// One animation/follow frame: glide toward the target (the spot by the
+// taskbar, dodging flyouts, or tucked away when hiding).
+// Once the test has finished the panel behaves like any flyout: the next
+// click outside it, a switch to another window, or a shell flyout opening
+// over it (Quick Settings, notifications, Start) closes it at once. It never
+// steps aside first. Returns true when it started closing.
+bool PanelCloseCheck(HWND hwnd) {
+    Panel& P = g_panel;
+    if (P.hiding || StRunning()) return false;
+    HWND fg = GetForegroundWindow();
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    bool btn = down(VK_LBUTTON) || down(VK_RBUTTON) || down(VK_MBUTTON);
+    if (!P.fgAfterTest) {  // first frame after the test ended
+        P.fgAfterTest = fg ? fg : (HWND)1;
+        P.btnDown = btn;   // a click already held doesn't count
+        return false;
+    }
+    bool pressed = btn && !P.btnDown;
+    P.btnDown = btn;
+    POINT pt;
+    GetCursorPos(&pt);
+    RECT wr;
+    GetWindowRect(hwnd, &wr);
+    bool close = (pressed && !PtInRect(&wr, pt)) ||
+                 (fg != P.fgAfterTest && fg != hwnd);
+    if (!close) {
+        // A shell flyout now overlaps the panel's home spot.
+        RECT r, d;
+        PanelPlace(&r);
+        d = r;
+        PanelDodge(&d);
+        // Only a flyout that newly covers it: one already open when the
+        // test ended (the panel had stepped aside) keeps it up.
+        int ox = d.left - r.left, oy = d.top - r.top;
+        close = (ox || oy) && (ox != P.offX || oy != P.offY);
+    }
+    if (close) PanelHide();
+    return close;
+}
+
+void PanelStep(HWND hwnd) {
+    Panel& P = g_panel;
+    RECT r;
+    PanelPlace(&r);
+    // Open/close springs own the motion; a step-aside spring keeps listening
+    // so it can retarget if another flyout opens mid-move.
+    if (P.hiding) return;
+    if (PanelCloseCheck(hwnd)) return;
+    if (P.animating && !P.dodging) return;
+    bool dodged = false;
+    // Scan every tick (15 ms): Quick Settings opens in ~200 ms, so the
+    // panel has to start moving almost at once to clear it.
+    {
+        RECT d = r;
+        PanelDodge(&d);
+        int ox = d.left - r.left, oy = d.top - r.top;
+        // Flyouts animate in: wait until the new spot is the same on two
+        // scans in a row (~30 ms) so a half-open frame can't send the
+        // panel the wrong way. An uncloak event skips the wait: the
+        // flyout's rect is already final then.
+        if (P.forceDodge) {
+            P.forceDodge = false;
+            P.pendX = ox;
+            P.pendY = oy;
+            P.pendN = 2;
+        } else if (ox == P.pendX && oy == P.pendY) P.pendN++;
+        else {
+            P.pendX = ox;
+            P.pendY = oy;
+            P.pendN = 1;
+        }
+        if (P.pendN >= 2 && (ox != P.offX || oy != P.offY)) {
+            P.offX = ox;
+            P.offY = oy;
+            dodged = true;
+        }
+    }
+    if (P.animating) return;  // the running step-aside picks up the new offset
+    OffsetRect(&r, P.offX, P.offY);
+    P.dodge = r;
+    RECT cur;
+    GetWindowRect(hwnd, &cur);
+    if (cur.left != r.left || cur.top != r.top) {
+        P.px = cur.left;
+        P.py = cur.top;
+        if (dodged) {
+            P.dodging = true;  // a quicker, firmer spring than opening
+            PanelRun();
+            P.dodging = false;
+            return;
+        }
+        // The taskbar moved: stay rigidly attached, no spring lag. (The
+        // SetWindowPos hook normally already moved us in the same frame.)
+        SetWindowPos(hwnd, nullptr, r.left, r.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        P.px = r.left;
+        P.py = r.top;
+    }
+}
+
+// Spring physics, the way iOS and ColorOS move things: the panel is a mass
+// on a damped spring pulled toward its target. Velocity is kept across
+// retargets, so an open interrupted by a close (or a reopen mid-close)
+// turns around smoothly instead of restarting, and following the taskbar or
+// stepping aside for a flyout uses the same feel.
+//
+// Frames are paced by DwmFlush(), once per display refresh (60/90/120/144
+// Hz), with time from QueryPerformanceCounter and 1 ms integration
+// substeps, so the motion is identical at any refresh rate. The loop pumps
+// messages, so clicks and the test's updates keep working mid-motion.
+void PanelRun() {
+    Panel& P = g_panel;
+    HWND h = P.hwnd;
+    if (!h || P.animating) return;
+    P.animating = true;
+    using Flush = HRESULT(WINAPI*)();
+    static Flush flush = [] {
+        HMODULE dwm = LoadLibraryExW(L"dwmapi.dll", nullptr,
+                                     LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return dwm ? (Flush)(void*)GetProcAddress(dwm, "DwmFlush") : nullptr;
+    }();
+    constexpr double kTau = 6.283185307179586;
+    LARGE_INTEGER freq, last, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&last);
+    int lastX = INT_MIN, lastY = INT_MIN;
+    bool hidden = false, quit = false;
+    WPARAM quitCode = 0;
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        double dt = double(now.QuadPart - last.QuadPart) / freq.QuadPart;
+        last = now;
+        if (dt > 1.0 / 30) dt = 1.0 / 30;  // after a hitch, don't teleport
+
+        RECT spot;
+        PanelPlace(&spot);  // live: the taskbar may be moving right now
+        OffsetRect(&spot, P.offX, P.offY);
+        P.dodge = spot;
+        bool hide = P.hiding;
+        RECT goal = hide ? PanelTucked(P.dodge) : P.dodge;
+        double tx = goal.left, ty = goal.top;
+        // Closing aims past the tucked spot, so the panel is still moving
+        // fast when it vanishes behind the taskbar: a dismissal with
+        // momentum, never a slow crawl at the end.
+        double ax = tx, ay = ty;
+        if (hide) {
+            ax += (tx - P.dodge.left) * 0.4;
+            ay += (ty - P.dodge.top) * 0.4;
+        }
+        // response (s) and damping ratio, as in SwiftUI's .spring(): opening
+        // settles with a whisper of overshoot; closing is critically damped.
+        double resp = hide ? 0.55 : P.dodging ? 0.28 : 0.50;
+        double zeta = hide ? 1.0 : P.dodging ? 0.90 : 0.82;
+        double k = (kTau / resp) * (kTau / resp), c = 2 * zeta * (kTau / resp);
+        int n = (int)(dt / 0.001) + 1;
+        double st = dt / n;
+        for (int i = 0; i < n; i++) {  // semi-implicit Euler: stable, cheap
+            P.vx += (-k * (P.px - ax) - c * P.vx) * st;
+            P.vy += (-k * (P.py - ay) - c * P.vy) * st;
+            P.px += P.vx * st;
+            P.py += P.vy * st;
+        }
+
+        bool done;
+        if (hide) {
+            switch (P.edge) {  // fully tucked behind the taskbar?
+                case 0: done = P.py >= ty; break;
+                case 1: done = P.py <= ty; break;
+                case 2: done = P.px <= tx; break;
+                default: done = P.px >= tx; break;
+            }
+            hidden = done;
+        } else {
+            auto within = [](double a, double b, double e) {
+                return a - b < e && b - a < e;
+            };
+            done = within(P.px, tx, 0.5) && within(P.py, ty, 0.5) &&
+                   within(P.vx, 0, 12) && within(P.vy, 0, 12);
+            if (done) {
+                P.px = tx;
+                P.py = ty;
+                P.vx = P.vy = 0;
+            }
+        }
+
+        int ix = (int)(P.px < 0 ? P.px - 0.5 : P.px + 0.5);
+        int iy = (int)(P.py < 0 ? P.py - 0.5 : P.py + 0.5);
+        if (!hidden && (ix != lastX || iy != lastY)) {
+            SetWindowPos(h, nullptr, ix, iy, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                             SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+            // Parts that were off-screen or behind the taskbar come back
+            // invalid; paint them now or they show up blank mid-motion.
+            UpdateWindow(h);
+            lastX = ix;
+            lastY = iy;
+        }
+        if (done) break;
+
+        if (!flush || FAILED(flush())) Sleep(4);  // DWM off: rough pacing
+
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                quit = true;
+                quitCode = msg.wParam;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (quit || !IsWindow(h)) break;
+    }
+    P.animating = false;
+    if (quit) PostQuitMessage((int)quitCode);
+    if (!IsWindow(h)) return;
+    if (hidden) {
+        ShowWindow(h, SW_HIDE);
+        KillTimer(h, kFollowTimer);
+        PanelWatchFlyouts(false);
+        P.hiding = false;
+        P.vx = P.vy = 0;
+    } else if (!P.hiding && !P.settled) {  // fully out: lift above the taskbar
+        P.settled = true;
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+void PanelHide() {
+    Panel& P = g_panel;
+    HWND h = P.hwnd;
+    if (!h || !IsWindowVisible(h) || P.hiding) return;
+    P.hiding = true;
+    P.settled = false;
+    SetWindowPos(h, PanelBehind(), 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    // Letting go: a small upward flick before it falls in, the way a card
+    // you release lifts off your finger.
+    double kick = PS(700);
+    switch (P.edge) {
+        case 0: P.vy -= kick; break;
+        case 1: P.vy += kick; break;
+        case 2: P.vx += kick; break;
+        default: P.vx -= kick; break;
+    }
+    PanelRun();  // already running: it just turns around
+    // The test keeps running; reopening shows its progress or result.
+}
+
+LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Panel& P = g_panel;
+    auto hit = [&](LPARAM l) {
+        POINT pt = {(short)LOWORD(l), (short)HIWORD(l)};
+        return PtInRect(&P.btn, pt) ? 1 : PtInRect(&P.close, pt) ? 2
+               : PtInRect(&P.rerun, pt) ? 3 : 0;
+    };
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            PanelPaint(dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_NS_FLYOUT:
+            // A flyout just opened or closed: scan now, and take the new spot
+            // without waiting for a second confirming scan.
+            if (IsWindowVisible(hwnd)) {
+                P.forceDodge = true;
+                PanelStep(hwnd);
+            }
+            return 0;
+        case WM_TIMER:
+            if (wp == kFollowTimer) {
+                PanelStep(hwnd);
+                return 0;
+            }
+            [[fallthrough]];
+        case WM_NS_ST_UPDATE:
+            // Values ease toward each new reading at display rate; the timer
+            // stops once the test is over and everything has come to rest.
+            PanelEase();
+            if (IsWindowVisible(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+            if (msg == WM_TIMER && !StRunning() && !P.easing)
+                KillTimer(hwnd, kPanelTimer);
+            else if (msg == WM_NS_ST_UPDATE)
+                SetTimer(hwnd, kPanelTimer, kPanelFrameMs, nullptr);
+            return 0;
+        case WM_MOUSEMOVE: {
+            if (!P.tracking) {
+                TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+                P.tracking = TrackMouseEvent(&tme);
+            }
+            int h = hit(lp);
+            if (h != P.hover) {
+                P.hover = h;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            P.tracking = false;
+            P.hover = P.pressed = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONDOWN:
+            P.pressed = hit(lp);
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONUP: {
+            ReleaseCapture();
+            int h = hit(lp), was = P.pressed;
+            P.pressed = 0;
+            if (h && h == was) {
+                StPhase cur = (StPhase)g_st.phase.load();
+                if (h == 1) {
+                    // "Completed" is a status; the round button reruns.
+                    if (cur != StPhase::Done) PanelToggleTest();
+                } else if (h == 3) {
+                    if (!StRunning()) PanelToggleTest();
+                } else {
+                    PanelHide();
+                }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) PanelHide();
+            else if (wp == VK_RETURN || wp == VK_SPACE) PanelToggleTest();
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wp) == WA_INACTIVE) {
+                // Mid-test, clicking elsewhere (Quick Settings, notifications,
+                // another app) leaves the panel up, stepping aside for shell
+                // flyouts, so the test never seems to vanish.
+                if (!StRunning()) PanelHide();
+                else P.fgAfterTest = nullptr;
+            } else {
+                P.fgAfterTest = nullptr;
+            }
+            return 0;
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+            PanelTheme();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_DESTROY:
+            KillTimer(hwnd, kPanelTimer);
+            KillTimer(hwnd, kFollowTimer);
+            PanelWatchFlyouts(false);
+            g_panelHwnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Where the panel goes: just off the taskbar's inner edge, like Quick
+// Settings. Computed from the taskbar's *current* rect, so it follows the
+// taskbar when it moves, resizes or auto-hides.
+void PanelPlace(RECT* out) {
+    Panel& P = g_panel;
+    HWND tb = P.taskbar;
+    if (!IsWindow(tb)) tb = P.taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    int w = PS(kPanelW), h = PS(kPanelH), m = PS(12);
+
+    RECT t = {};
+    if (tb) GetWindowRect(tb, &t);
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfoW(tb ? MonitorFromWindow(tb, MONITOR_DEFAULTTONEAREST)
+                       : MonitorFromWindow(P.hwnd, MONITOR_DEFAULTTOPRIMARY),
+                    &mi);
+    const RECT& mon = mi.rcMonitor;
+
+    // The visible band: Win11's Shell_TrayWnd can be taller than what's drawn,
+    // the notification area always matches the drawn band.
+    RECT band = t, tray;
+    if (tb && VisibleChildRect(tb, FindWindowExW(tb, nullptr, L"TrayNotifyWnd",
+                                                 nullptr), &tray)) {
+        if (t.right - t.left >= t.bottom - t.top) {
+            band.top = tray.top;
+            band.bottom = tray.bottom;
+        } else {
+            band.left = tray.left;
+            band.right = tray.right;
+        }
+    }
+
+    RECT a = band;  // horizontal/vertical center to line up with
+    bool anchored = P.anchor && IsWindow(P.anchor);
+    if (anchored) GetWindowRect(P.anchor, &a);
+    else if (tb) a = {band.right - w, band.top, band.right - m, band.bottom};
+    int cx = (a.left + a.right) / 2, cy = (a.top + a.bottom) / 2;
+
+    bool horiz = !tb || (t.right - t.left) >= (t.bottom - t.top);
+    int x, y;
+    if (horiz) {
+        P.edge = (t.top + t.bottom) / 2 >= (mon.top + mon.bottom) / 2 ? 0 : 1;
+        x = Clamp<int>(cx - w / 2, mon.left + m, (int)mon.right - w - m);
+        y = P.edge == 0 ? band.top - h - m : band.bottom + m;
+    } else {
+        P.edge = (t.left + t.right) / 2 < (mon.left + mon.right) / 2 ? 2 : 3;
+        // Next to the meter when opened from it; otherwise at the tray end
+        // (the bottom), where Windows puts its own flyouts on a side taskbar.
+        y = anchored ? cy - h / 2 : (int)band.bottom - h - m;
+        y = Clamp<int>(y, mon.top + m, (int)mon.bottom - h - m);
+        x = P.edge == 2 ? band.right + m : band.left - w - m;
+    }
+    x = Clamp<int>(x, mon.left, (int)mon.right - w);
+    y = Clamp<int>(y, mon.top, (int)mon.bottom - h);
+    *out = {x, y, x + w, y + h};
+}
+
+// Shows the panel next to `anchor` (the meter, or the tray when null).
+void ShowPanel(HWND anchor) {
+    Panel& P = g_panel;
+    if (!P.hwnd) {
+        WNDCLASSW wc = {};
+        // No CS_DROPSHADOW: DWM draws the real (rounded) shadow, since the
+        // frame is extended over the whole window.
+        wc.lpfnWndProc = PanelProc;
+        wc.hInstance = ModInstance();
+        wc.lpszClassName = kPanelClass;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        RegisterClassW(&wc);
+        P.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, kPanelClass,
+                                 L"Speed test", WS_POPUP, 0, 0, 1, 1, nullptr,
+                                 nullptr, ModInstance(), nullptr);
+        if (!P.hwnd) return;
+        g_panelHwnd = P.hwnd;
+    }
+    PanelTheme();
+
+    HWND root = anchor && IsWindow(anchor) ? GetAncestor(anchor, GA_ROOT) : nullptr;
+    P.taskbar = root ? root : FindWindowW(L"Shell_TrayWnd", nullptr);
+    P.anchor = root ? anchor : nullptr;
+    P.dpi = P.taskbar ? GetDpiForWindow(P.taskbar) : 96;
+    if (!P.dpi) P.dpi = 96;
+
+    RECT r;
+    PanelPlace(&r);
+    P.dodge = r;
+    PanelDodge(&P.dodge);  // rise straight to a spot clear of open flyouts
+    P.offX = P.dodge.left - r.left;
+    P.offY = P.dodge.top - r.top;
+    P.fgAfterTest = nullptr;
+    bool fresh = !IsWindowVisible(P.hwnd);
+    if (fresh) {
+        // Start tucked behind the taskbar and spring out of it.
+        RECT h0 = PanelTucked(P.dodge);
+        P.px = h0.left;
+        P.py = h0.top;
+        P.vx = P.vy = 0;
+        P.settled = false;
+    }
+    P.hiding = false;  // reopened mid-close: the spring turns it around
+    SetWindowPos(P.hwnd, P.settled ? HWND_TOPMOST : PanelBehind(),
+                 (int)P.px, (int)P.py, r.right - r.left, r.bottom - r.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(P.hwnd, nullptr, FALSE);
+    UpdateWindow(P.hwnd);  // paint before it moves: no blank frames
+    // Never take focus: the user's active window keeps the keyboard.
+    SetWindowPos(P.hwnd, P.settled ? HWND_TOPMOST : PanelBehind(), 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetTimer(P.hwnd, kFollowTimer, 15, nullptr);
+    PanelWatchFlyouts(true);
+    SetTimer(P.hwnd, kPanelTimer, kPanelFrameMs, nullptr);  // eases values in
+
+    // Opening the panel starts a test unless one already ran or is running.
+    if ((StPhase)g_st.phase.load() == StPhase::Idle && !g_st.stopped)
+        PanelToggleTest();
+    if (!P.settled) PanelRun();
+}
+
+void DestroyPanel() {  // host thread, on shutdown
+    StStop(true);
+    if (g_panel.hwnd) DestroyWindow(g_panel.hwnd);
+    for (HFONT f : {g_panel.fTitle, g_panel.fBody, g_panel.fSmall, g_panel.fValue,
+                    g_panel.fHero, g_panel.fStrong, g_panel.fLabel})
+        if (f) DeleteObject(f);
+    if (g_panel.surf) DeleteObject(g_panel.surf);
+    g_panel = Panel();
+    UnregisterClassW(kPanelClass, ModInstance());
+    http::Unload();
+}
+
+void RequestSpeedTest(HWND anchor) {
+    if (HWND h = g_host) PostMessageW(h, WM_NS_SPEEDTEST, (WPARAM)anchor, 0);
+}
+
+// ---- redirect Windows' own "Perform speed test" (opens Bing) ----
+
+// The button launches a Microsoft short link that the browser then forwards
+// to https://www.bing.com/search?q=Internet%20speed%20test&form=wspeed2:
+//   tray menu:      https://go.microsoft.com/fwlink/?linkid=2324916
+//   quick settings: https://go.microsoft.com/fwlink/?linkid=2325015
+// The Bing form (and its URL-encoded copy) is matched too, for builds that
+// open Bing directly. The "wspeed" tag is unique to that button, so a speed
+// test you search on Bing yourself is never intercepted.
+bool IsWindowsSpeedTestUrl(const wchar_t* f) {
+    if (!f) return false;
+    if (ContainsI(f, L"linkid=2324916") || ContainsI(f, L"linkid=2325015") ||
+        ContainsI(f, L"linkid%3d2324916") || ContainsI(f, L"linkid%3d2325015"))
+        return true;
+    return ContainsI(f, L"bing.com") &&
+           (ContainsI(f, L"form=wspeed") || ContainsI(f, L"form%3dwspeed"));
+}
+
+// The button lives in explorer, ShellHost or ShellExperienceHost, and the
+// browser may be spawned by RuntimeBroker. Every one of them forwards to
+// the panel, which always lives in explorer. Returns false when the meter
+// isn't running, so Windows falls back to its normal behavior.
+bool ForwardSpeedTest() {
+    if (g_host) {
+        RequestSpeedTest(nullptr);
+        return true;
+    }
+    HWND host = FindWindowW(kHostClass, nullptr);
+    if (!host) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(host, &pid);
+    AllowSetForegroundWindow(pid);  // we hold the click, hand focus over
+    return PostMessageW(host, WM_NS_SPEEDTEST, 0, 0) != FALSE;
+}
+
+using ShellExecuteExW_t = BOOL(WINAPI*)(SHELLEXECUTEINFOW*);
+ShellExecuteExW_t g_origShellExecuteExW = nullptr;
+BOOL WINAPI ShellExecuteExW_Hook(SHELLEXECUTEINFOW* sei) {
+    if (sei && g_replaceWinTest && IsWindowsSpeedTestUrl(sei->lpFile) &&
+        ForwardSpeedTest()) {
+        Wh_Log(L"Speed test: ShellExecuteEx intercepted");
+        sei->hInstApp = (HINSTANCE)42;  // > 32 = success
+        if (sei->fMask & SEE_MASK_NOCLOSEPROCESS) sei->hProcess = nullptr;
+        return TRUE;
+    }
+    return g_origShellExecuteExW(sei);
+}
+
+using ShellExecuteW_t = HINSTANCE(WINAPI*)(HWND, LPCWSTR, LPCWSTR, LPCWSTR,
+                                           LPCWSTR, INT);
+ShellExecuteW_t g_origShellExecuteW = nullptr;
+HINSTANCE WINAPI ShellExecuteW_Hook(HWND h, LPCWSTR op, LPCWSTR file,
+                                    LPCWSTR params, LPCWSTR dir, INT show) {
+    if (g_replaceWinTest && IsWindowsSpeedTestUrl(file) && ForwardSpeedTest()) {
+        Wh_Log(L"Speed test: ShellExecute intercepted");
+        return (HINSTANCE)42;
+    }
+    return g_origShellExecuteW(h, op, file, params, dir, show);
+}
+
+// Catch-all: however the shell resolves the link (Launcher API, protocol
+// handler, ShellExecute), the browser process is finally created here with
+// the URL on its command line. Cancelling with ERROR_CANCELLED is the code
+// the shell treats as "user cancelled", so no error dialog appears.
+using CreateProcessInternalW_t = BOOL(WINAPI*)(
+    HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES,
+    BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION,
+    PHANDLE);
+CreateProcessInternalW_t g_origCreateProcessInternalW = nullptr;
+BOOL WINAPI CreateProcessInternalW_Hook(
+    HANDLE token, LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES pa,
+    LPSECURITY_ATTRIBUTES ta, BOOL inherit, DWORD flags, LPVOID env,
+    LPCWSTR dir, LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi,
+    PHANDLE newToken) {
+    if (g_replaceWinTest && IsWindowsSpeedTestUrl(cmd) && ForwardSpeedTest()) {
+        Wh_Log(L"Speed test: browser launch intercepted");
+        SetLastError(ERROR_CANCELLED);
+        return FALSE;
+    }
+    return g_origCreateProcessInternalW(token, app, cmd, pa, ta, inherit,
+                                        flags, env, dir, si, pi, newToken);
+}
+
+// Auto-hide: whoever slides the taskbar (Windows itself, or a mod such as
+// "Taskbar auto-hide instant show") does it with SetWindowPos on explorer's
+// thread, one call per animation frame. Hooking that call lets the panel
+// move by the same amount in the same frame, so it rides the taskbar at
+// exactly its speed and easing instead of chasing it from a timer.
+using SetWindowPos_t = BOOL(WINAPI*)(HWND, HWND, int, int, int, int, UINT);
+SetWindowPos_t g_origSetWindowPos = nullptr;
+BOOL WINAPI SetWindowPos_Hook(HWND hwnd, HWND after, int x, int y, int cx,
+                              int cy, UINT flags) {
+    BOOL ok = g_origSetWindowPos(hwnd, after, x, y, cx, cy, flags);
+    Panel& P = g_panel;
+    if (ok && hwnd == P.taskbar && hwnd && !(flags & SWP_NOMOVE) &&
+        P.hwnd && P.settled && !P.animating && !P.hiding &&
+        IsWindowVisible(P.hwnd)) {
+        RECT r;
+        PanelPlace(&r);  // reads the taskbar's new rect
+        OffsetRect(&r, P.offX, P.offY);
+        // Async: the panel lives on our own thread; never block the
+        // taskbar's animation on it. It lands before the next composition.
+        g_origSetWindowPos(P.hwnd, nullptr, r.left, r.top, 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                               SWP_ASYNCWINDOWPOS);
+    }
+    return ok;
+}
+
+bool g_launchHooks = false;
+
+void InstallHooks(bool explorer) {
+    if (explorer)
+        Wh_SetFunctionHook((void*)SetWindowPos, (void*)SetWindowPos_Hook,
+                           (void**)&g_origSetWindowPos);
+    // Launch hooks only when the user opted in: otherwise no process
+    // creation or ShellExecute call in the shell ever passes through us.
+    g_launchHooks = Wh_GetIntSetting(L"replaceWindowsSpeedTest") != 0;
+    if (!g_launchHooks) return;
+    if (void* cpi = (void*)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"),
+                                          "CreateProcessInternalW"))
+        Wh_SetFunctionHook(cpi, (void*)CreateProcessInternalW_Hook,
+                           (void**)&g_origCreateProcessInternalW);
+    else
+        Wh_Log(L"Speed test: CreateProcessInternalW not found");
+    Wh_SetFunctionHook((void*)ShellExecuteExW, (void*)ShellExecuteExW_Hook,
+                       (void**)&g_origShellExecuteExW);
+    Wh_SetFunctionHook((void*)ShellExecuteW, (void*)ShellExecuteW_Hook,
+                       (void**)&g_origShellExecuteW);
+}
+
+// ---------------- host window ----------------
+
+LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_taskbarCreatedMsg && msg == g_taskbarCreatedMsg) {  // explorer rebuilt taskbar
+        g_lastUia = 0;
+        EnsureMeters(GetConfig());
+        Broadcast(WM_NS_RELAYOUT);
+        return 0;
+    }
+    switch (msg) {
+        case WM_TIMER:
+            if (wp == kSampleTimer) Tick();
+            return 0;
+        case WM_SETTINGCHANGE:
+        case WM_DISPLAYCHANGE:
+        case WM_DPICHANGED:
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+            ReadSystemState();
+            g_lastUia = 0;
+            Broadcast(WM_NS_RELAYOUT);
+            break;
+        case WM_NS_SETTINGS: {
+            LoadConfig();
+            Config c = GetConfig();
+            SetLazyTimer(hwnd, kSampleTimer, (UINT)c.interval);
+            g_lastUia = 0;
+            EnsureMeters(c);
+            Broadcast(WM_NS_RELAYOUT);
+            return 0;
+        }
+        case WM_NS_SPEEDTEST:
+            ShowPanel((HWND)wp);
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            KillTimer(hwnd, kSampleTimer);
+            DestroyPanel();
+            DestroyAllMeters();
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+DWORD WINAPI WorkerProc(LPVOID) {
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = HostProc;
+    wc.hInstance = ModInstance();
+    wc.lpszClassName = kHostClass;
+    RegisterClassW(&wc);
+
+    // Hidden top-level window: receives theme/DPI/display/taskbar broadcasts.
+    HWND host = CreateWindowExW(WS_EX_TOOLWINDOW, kHostClass, L"", WS_POPUP, 0,
+                                0, 0, 0, nullptr, nullptr, ModInstance(), nullptr);
+    g_host = host;
+    // Let ShellExperienceHost (AppContainer, lower integrity) reach us.
+    if (host) ChangeWindowMessageFilterEx(host, WM_NS_SPEEDTEST, MSGFLT_ALLOW,
+                                          nullptr);
+    SetEvent(g_workerReady);
+
+    if (host) {
+        ReadSystemState();
+        Tick();
+        SetLazyTimer(host, kSampleTimer, (UINT)GetConfig().interval);
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    g_host = nullptr;
+    if (g_uia) {
+        g_uia->Release();
+        g_uia = nullptr;
+    }
+    UnregisterClassW(kHostClass, ModInstance());
+    if (SUCCEEDED(hrCo)) CoUninitialize();
+    return 0;
+}
+
+void Start() {
+    if (g_worker) return;
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = MeterProc;
+    wc.hInstance = ModInstance();
+    wc.lpszClassName = kMeterClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    g_prev.clear();
+    g_prevTick = 0;
+    g_workerReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_worker = CreateThread(nullptr, 0, WorkerProc, nullptr, 0, nullptr);
+    if (g_worker) WaitForSingleObject(g_workerReady, 5000);
+}
+
+void Stop() {
+    if (!g_worker) return;
+    if (HWND h = g_host) PostMessageW(h, WM_CLOSE, 0, 0);
+    WaitForSingleObject(g_worker, 15000);
+    CloseHandle(g_worker);
+    g_worker = nullptr;
+    if (g_workerReady) {
+        CloseHandle(g_workerReady);
+        g_workerReady = nullptr;
+    }
+    UnregisterClassW(kMeterClass, ModInstance());
+}
+
+}  // namespace ns
+// ===================== end internet speed meter =====================
+
+
+// The meter runs in explorer only; the shell helper processes just carry the
+// speed test redirect hooks.
+bool g_isExplorer = false;
+
+BOOL Wh_ModInit() {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const wchar_t* name = path;
+    for (DWORD i = 0; i < n; i++)
+        if (path[i] == L'\\') name = path + i + 1;
+    g_isExplorer = _wcsicmp(name, L"explorer.exe") == 0;
+    Wh_Log(L"Init in %ls", name);
+
+    ns::LoadConfig();
+    ns::InstallHooks(g_isExplorer);
+    if (g_isExplorer) ns::Start();
+    return TRUE;
+}
+
+void Wh_ModUninit() {
+    Wh_Log(L"Uninit");
+    if (g_isExplorer) ns::Stop();
+}
+
+BOOL Wh_ModSettingsChanged(BOOL* bReload) {
+    // Turning the launch hooks on or off needs a reload to (un)install them.
+    if ((Wh_GetIntSetting(L"replaceWindowsSpeedTest") != 0) !=
+        ns::g_launchHooks) {
+        *bReload = TRUE;
+        return TRUE;
+    }
+    ns::LoadConfig();
+    if (HWND h = ns::g_host) {
+        PostMessageW(h, ns::WM_NS_SETTINGS, 0, 0);
+    }
+    return TRUE;
+}
