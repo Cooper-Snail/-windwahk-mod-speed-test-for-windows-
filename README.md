@@ -1,6 +1,10 @@
 # -windwahk-mod-speed-test-for-windows-
 This is a windhawk mod, built for windows this mod used to test your internet speed without any dependencies (browser) right at your finger tips
 
+Steps to follow:
+open windhawk > create new mod > copy paste the source code > compile it > enable mod, settings user preferences
+
+
 1. Insert network indicator left or right side
 2. Color indication as your preference
 3. Test measurement user choice either in (MEGABYTES/sec, or megabits/sec) (MB/s, Mb/s)
